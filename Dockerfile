@@ -5,7 +5,11 @@ COPY package.json package-lock.json ./
 ARG NPM_REGISTRY=https://registry.npmjs.org
 RUN npm ci --registry=${NPM_REGISTRY} --replace-registry-host=always
 COPY . .
-RUN npm run build && npm prune --omit=dev
+# Pass identity captured from the source repository when .git is excluded.
+ARG BUILD_GIT_HASH
+ARG BUILD_GIT_DIRTY
+ARG BUILD_TIMESTAMP
+RUN BUILD_GIT_HASH="$BUILD_GIT_HASH" BUILD_GIT_DIRTY="$BUILD_GIT_DIRTY" BUILD_TIMESTAMP="$BUILD_TIMESTAMP" npm run build && npm prune --omit=dev
 
 FROM node:24-alpine
 WORKDIR /app

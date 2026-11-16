@@ -4,6 +4,7 @@ import {MonacoBinding} from 'y-monaco';
 import {WebsocketProvider} from 'y-websocket';
 import * as decoding from 'lib0/decoding';
 import {canEdit} from '../editor-state.js';
+import {pruneDrafts} from '../draft-store.js';
 import {followTheme} from '../theme.js';
 import {appUrl,appWsUrl} from '../app-root.js';
 import {renderMarkdown} from '../preview.js';
@@ -49,8 +50,23 @@ export function mountSession({editorHost,previewHost,store}){
   else {provider=new WebsocketProvider(appWsUrl('collab'),data.collab.roomId,ydoc,{params:{sid},connect:false,disableBc:true,maxBackoffTime:5000});provider.messageHandlers[4]=(_encoder,decoder)=>{try{void renderStatus(JSON.parse(decoding.readVarString(decoder)));}catch{notice('协作状态消息无效');}};}
   binding=new MonacoBinding(ytext,model,new Set([editor]),provider?.awareness);undo=new Y.UndoManager(ytext,{trackedOrigins:new Set([binding])});
   editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyZ,()=>undo.undo());editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyMod.Shift|monaco.KeyCode.KeyZ,()=>undo.redo());editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyY,()=>undo.redo());editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS,save);editor.addCommand(monaco.KeyMod.Alt|monaco.KeyCode.KeyZ,()=>controller.setWrapped(!snapshot().wrapped));
-  const wrapPairs={'*':'*','_':'_','~':'~'};
-  const wrapSelection=e=>{const key=e.browserEvent?.key||'',pair=wrapPairs[key];if(!pair)return;const sel=editor.getSelection();if(!sel||sel.isEmpty())return;const text=model.getValueInRange(sel);e.preventDefault();e.stopPropagation();editor.executeEdits('wrap-selection',[{range:sel,text:key+text+pair,forceMoveMarkers:true}]);const start=sel.getStartPosition(),end=sel.getEndPosition();editor.setSelection(new monaco.Selection(start.lineNumber,start.column+1,end.lineNumber,end.column+1));};
+  const wrapPairs={'*':'*','_':'_','~':'~','$':'$'};
+  const wrapSelection=e=>{
+   const browser=e.browserEvent,key=browser?.key||'',pair=wrapPairs[key];
+   if(!pair||snapshot().readOnly||browser?.isComposing||browser?.keyCode===229||e.ctrlKey||e.metaKey||e.altKey||browser?.ctrlKey||browser?.metaKey||browser?.altKey)return;
+   const selections=editor.getSelections();
+   // Let Monaco handle ordinary typing (including mixed cursor/selection input).
+   if(!selections?.length||selections.some(sel=>sel.isEmpty()))return;
+   const spans=selections.map(sel=>({sel,start:model.getOffsetAt(sel.getStartPosition()),end:model.getOffsetAt(sel.getEndPosition())}));
+   const edits=spans.map(({sel})=>({range:sel,text:key+model.getValueInRange(sel)+pair,forceMoveMarkers:true}));
+   e.preventDefault();e.stopPropagation();
+   editor.executeEdits('wrap-selection',edits,()=>spans.map(({sel,start,end})=>{
+    const shift=spans.reduce((sum,other)=>sum+(other.end<=start?key.length+pair.length:0),0);
+    const first=model.getPositionAt(start+shift+key.length),last=model.getPositionAt(end+shift+key.length);
+    const backward=sel.selectionStartLineNumber===sel.endLineNumber&&sel.selectionStartColumn===sel.endColumn;
+    return backward?new monaco.Selection(last.lineNumber,last.column,first.lineNumber,first.column):new monaco.Selection(first.lineNumber,first.column,last.lineNumber,last.column);
+   }));
+  };
   disposables.push(editor.onKeyDown(wrapSelection));
   disposables.push(model.onDidChangeContent(updateDocument),editor.onDidChangeCursorSelection(position));
   if(!demo){try{pruneDrafts(globalThis.localStorage);}catch{}}
