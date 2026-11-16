@@ -11,11 +11,11 @@ function packet(type,write){const e=enc.createEncoder();enc.writeVarUint(e,type)
 function atomic(file,bytes){const tmp=file+'.tmp';fs.writeFileSync(tmp,bytes,{mode:0o600});fs.renameSync(tmp,file);}
 class Journal{
  constructor(dir,key){this.dir=path.join(dir,key);fs.mkdirSync(this.dir,{recursive:true,mode:0o700});this.meta=path.join(this.dir,'meta.json');this.snapshot=path.join(this.dir,'state.bin');this.log=path.join(this.dir,'updates.bin');}
- restore(doc){if(!fs.existsSync(this.meta))return null;const meta=JSON.parse(fs.readFileSync(this.meta,'utf8'));if(fs.existsSync(this.snapshot))Y.applyUpdate(doc,fs.readFileSync(this.snapshot),'journal');if(fs.existsSync(this.log)){const data=fs.readFileSync(this.log);let pos=0;while(pos+4<=data.length){const n=data.readUInt32LE(pos);pos+=4;if(n>MAX_UPDATE||pos+n>data.length)throw Error('incomplete recovery journal');Y.applyUpdate(doc,data.subarray(pos,pos+n),'journal');pos+=n;}if(pos!==data.length)throw Error('truncated recovery journal');}return meta;}
+ restore(doc){if(!fs.existsSync(this.meta))return null;const meta=JSON.parse(fs.readFileSync(this.meta,'utf8'));if(!meta||!/^[a-f0-9]{64}$/.test(meta.baseHash)||!fs.existsSync(this.snapshot))throw Error('missing snapshot or invalid recovery metadata');if(fs.existsSync(this.snapshot))Y.applyUpdate(doc,fs.readFileSync(this.snapshot),'journal');if(fs.existsSync(this.log)){const data=fs.readFileSync(this.log);let pos=0;while(pos+4<=data.length){const n=data.readUInt32LE(pos);pos+=4;if(n>MAX_UPDATE||pos+n>data.length)throw Error('incomplete recovery journal');Y.applyUpdate(doc,data.subarray(pos,pos+n),'journal');pos+=n;}if(pos!==data.length)throw Error('truncated recovery journal');}return meta;}
  append(update){const h=Buffer.alloc(4);h.writeUInt32LE(update.length);const fd=fs.openSync(this.log,'a',0o600);try{fs.writeSync(fd,Buffer.concat([h,Buffer.from(update)]));fs.fdatasyncSync(fd);}finally{fs.closeSync(fd);}}
  checkpoint(doc,meta){atomic(this.snapshot,Y.encodeStateAsUpdate(doc));atomic(this.meta,JSON.stringify(meta));atomic(this.log,Buffer.alloc(0));}
 }
-function createCollaboration({server,sessions,live,checkInfo,getContents,lock,refresh,put,unlock,dataDir,origin,sameOrigin=(a,b)=>String(a||'')===String(b||''),stripPrefix=p=>String(p||'/'),saveDelay=1000,renewMs=240000,graceMs=15000}){
+function createCollaboration({server,sessions,live,checkInfo,getContents,lock,refresh,put,unlock,dataDir,recoverSession=sid=>sessions.get(sid),onAttach=()=>{},origin,sameOrigin=(a,b)=>String(a||'')===String(b||''),stripPrefix=p=>String(p||'/'),saveDelay=1000,renewMs=240000,graceMs=15000}){
  fs.mkdirSync(dataDir,{recursive:true,mode:0o700});const rooms=new Map(),pending=new Map();let stopping=false;const wss=new WebSocketServer({noServer:true,maxPayload:MAX_UPDATE});
  function status(r){return {revision:r.revision,persistedRevision:r.persistedRevision,dirty:r.revision!==r.persistedRevision,saving:!!r.saving,releasing:!!r.releasing,blocked:r.blocked||null,error:r.error||null,savedAt:r.savedAt||null,clients:r.connections.size,persistedHash:r.baseHash};}
  function sendStatus(r,ws){const bytes=packet(STATUS,e=>enc.writeVarString(e,JSON.stringify(status(r))));if(ws){if(ws.readyState===1)ws.send(bytes);}else for(const c of r.connections)if(c.readyState===1)c.send(bytes);}
@@ -28,15 +28,19 @@ function createCollaboration({server,sessions,live,checkInfo,getContents,lock,re
  }
  async function acquire(r){
   if(r.lockId)return;if(r.acquiring)return r.acquiring;
-  r.acquiring=(async()=>{const session=await writer(r),result=await lock(session);if(!result.ok){r.blocked='external-lock';throw Object.assign(Error('file locked outside collaboration room'),{status:409});}
+  r.acquiring=(async()=>{const session=await writer(r);session.recoveryLockId=r.recoveryLockId||null;session.pendingLockId=r.recoveryLockId||crypto.randomBytes(16).toString('hex');
+   // Write intent before acquiring: a crash after upstream acknowledgement remains recoverable.
+   atomic(path.join(r.journal.dir,'lock.json'),JSON.stringify({lockId:session.pendingLockId}));
+   const result=await lock(session);if(!result.ok){r.blocked='external-lock';throw Object.assign(Error('file locked outside collaboration room'),{status:409});}
    r.lockId=session.lockId;r.lockSession=session;r.writer=session;r.nextRenew=Date.now()+renewMs;
+   atomic(path.join(r.journal.dir,'lock.json'),JSON.stringify({lockId:r.lockId}));
   })().finally(()=>{r.acquiring=null;});return r.acquiring;
  }
  async function flush(r,final=false){
   if(r.releasing&&!final)throw Object.assign(Error('room is releasing'),{status:409});
   clearTimeout(r.timer);if(r.blocked)throw Object.assign(Error(r.blocked),{status:409});if(r.saving){await r.saving;if(r.revision!==r.persistedRevision)return flush(r,final);return status(r);}if(r.revision===r.persistedRevision)return status(r);
   const revision=r.revision,text=r.text();
-  r.saving=(async()=>{try{await acquire(r);const s=await writer(r);await refresh(s);const code=await put(s,text);if(code!==200)throw Object.assign(Error('PutFile HTTP '+code),{status:[401,403].includes(code)?403:code===409?409:502});r.persistedRevision=revision;r.baseHash=hash(text);r.version=(await checkInfo(s)).version||r.version;r.savedAt=Date.now();r.error=null;r.retry=1000;r.journal.checkpoint(r.doc,{baseHash:r.baseHash,eol:r.eol,savedAt:r.savedAt});}
+  r.saving=(async()=>{try{await acquire(r);const s=await writer(r);await refresh(s);const code=await put(s,text);if(code!==200)throw Object.assign(Error('PutFile HTTP '+code),{status:[401,403].includes(code)?403:code===409?409:502});r.persistedRevision=revision;r.baseHash=hash(text);r.version=(await checkInfo(s)).version||r.version;r.savedAt=Date.now();r.error=null;r.retry=1000;r.journal.checkpoint(r.doc,{epoch:r.epoch,baseHash:r.baseHash,eol:r.eol,savedAt:r.savedAt});}
    catch(e){r.error=e.message;if([401,403,409].includes(e.status))r.blocked=e.status===409?'lock-conflict':'permission-or-session';throw e;}
    finally{r.saving=null;sendStatus(r);if(!r.blocked&&r.revision!==r.persistedRevision){r.retry=Math.min((r.retry||1000)*2,60000);schedule(r,r.error?r.retry:saveDelay);}}})();sendStatus(r);await r.saving;return status(r);
  }
@@ -61,12 +65,14 @@ function createCollaboration({server,sessions,live,checkInfo,getContents,lock,re
   if(!r){if(!pending.has(key))pending.set(key,(async()=>{const cloud=await getContents(s),doc=new Y.Doc(),journal=new Journal(dataDir,key);let meta=null;try{meta=journal.restore(doc);}catch(e){doc.destroy();throw Object.assign(Error('recovery journal error; preserved for review: '+e.message),{status:503});}
     const eol=meta?.eol||(cloud.includes('\r\n')?'\r\n':'\n');let blocked=null;if(!meta)doc.getText('markdown').insert(0,canonical(cloud));
     const value=()=>doc.getText('markdown').toString().replace(/\n/g,eol),recovered=value();if(meta&&meta.baseHash!==hash(cloud)&&hash(recovered)!==hash(cloud))blocked='external-file-changed; download recovered copy before resolution';
-    const dirty=recovered!==cloud;const room={key,doc,journal,eol,version:info.version,text:value,members:new Map(),connections:new Set(),writer:null,lockId:null,revision:dirty?1:0,persistedRevision:0,baseHash:hash(cloud),blocked,timer:null,saving:null,lastSeen:Date.now(),savedAt:meta?.savedAt||null};
-    room.awareness=new awareness.Awareness(doc);room.awareness.setLocalState(null);if(!meta)journal.checkpoint(doc,{baseHash:room.baseHash,eol,savedAt:room.savedAt});
+    let recoveryLockId=null;try{const record=JSON.parse(fs.readFileSync(path.join(journal.dir,'lock.json'),'utf8'));if(/^[a-f0-9]{32}$/.test(record.lockId))recoveryLockId=record.lockId;}catch{}
+    const dirty=recovered!==cloud;const room={key,epoch:meta?.epoch||crypto.randomBytes(16).toString('hex'),doc,journal,eol,version:info.version,text:value,members:new Map(),connections:new Set(),writer:null,lockId:null,recoveryLockId,revision:dirty?1:0,persistedRevision:0,baseHash:hash(cloud),blocked,timer:null,saving:null,lastSeen:Date.now(),savedAt:meta?.savedAt||null};
+    room.awareness=new awareness.Awareness(doc);room.awareness.setLocalState(null);if(!meta?.epoch)journal.checkpoint(doc,{epoch:room.epoch,baseHash:meta?.baseHash||room.baseHash,eol,savedAt:room.savedAt});
     doc.on('update',(update,origin)=>{try{journal.append(update);}catch(e){room.blocked='journal-write-failed';room.error=e.message;}room.revision++;broadcast(room,packet(0,e=>sync.writeUpdate(e,update)));sendStatus(room);schedule(room);});
     room.awareness.on('update',({added,updated,removed})=>broadcast(room,packet(1,e=>enc.writeVarUint8Array(e,awareness.encodeAwarenessUpdate(room.awareness,added.concat(updated,removed))))));rooms.set(key,room);return room;})().finally(()=>pending.delete(key)));
    r=await pending.get(key);
   }
+  if(s.rehydrated&&s.roomEpoch&&s.roomEpoch!==r.epoch)throw Object.assign(Error('recovery journal identity lost; preserve local draft and reopen from host'),{status:409});
   if(r.releasing)return attach(s,sid);
   r.attaching=(r.attaching||0)+1;try{
   if(r.saving){await r.saving;const latest=await checkInfo(s);Object.assign(info,latest);}
@@ -74,7 +80,7 @@ function createCollaboration({server,sessions,live,checkInfo,getContents,lock,re
   if(stopping||r.releasing)throw Object.assign(Error('room is releasing'),{status:503});
   r.explicitLeave=false;r.members.set(sid,{session:s,canWrite:info.canWrite,info});s.roomKey=key;r.lastSeen=Date.now();
   if(info.canWrite&&!r.blocked&&!r.lockId){r.writer=s;try{await acquire(r);}catch(e){if(e.status!==409)throw e;}}
-  const canWrite=info.canWrite&&!r.blocked;return {room:r,info,canWrite};
+  s.roomEpoch=r.epoch;onAttach(s,sid);const canWrite=info.canWrite&&!r.blocked;return {room:r,info,canWrite};
   }finally{r.attaching--;if(!r.attaching&&!r.members.size&&!r.connections.size&&r.explicitLeave&&!r.releasing)void retire(r,'explicit').catch(()=>{});}
  }
  function identity(s,info){const id=info.userId||'user';return {id,name:info.userName||'Cloudreve user',color:'#'+hash(id).slice(0,6)};}
@@ -96,7 +102,7 @@ function createCollaboration({server,sessions,live,checkInfo,getContents,lock,re
     catch(e){r.error=e.message;console.warn(new Date().toISOString(),r.key.slice(0,8),'final-save-failed',e.status||502,'journal-retained');}
    }
    if(r.lockId){const owner=r.lockSession||r.writer;if(!owner)throw Object.assign(Error('owned lock has no release session'),{status:503});
-    owner.lockId=r.lockId;await unlock(owner);r.lockId=null;r.lockSession=null;
+    owner.lockId=r.lockId;await unlock(owner);r.lockId=null;r.lockSession=null;atomic(path.join(r.journal.dir,'lock.json'),'{}');
    }
    r.releasePending=false;clearTimeout(r.timer);r.awareness.destroy();r.doc.destroy();
    if(rooms.get(r.key)===r)rooms.delete(r.key);return true;
@@ -139,7 +145,7 @@ function createCollaboration({server,sessions,live,checkInfo,getContents,lock,re
  }
 
  server.on('upgrade',async(req,socket,head)=>{
-  try{const u=new URL(req.url,'http://localhost');const match=stripPrefix(u.pathname).match(/^\/collab\/([a-f0-9]{64})$/);if(!match)throw Error('not found');if(req.headers.origin&&!sameOrigin(req.headers.origin,origin(req)))throw Error('origin forbidden');const sid=u.searchParams.get('sid'),s=sessions.get(sid);if(!s||!live(s))throw Error('session invalid');const a=await attach(s,sid);if(a.room.key!==match[1])throw Error('room forbidden');
+  try{const u=new URL(req.url,'http://localhost');const match=stripPrefix(u.pathname).match(/^\/collab\/([a-f0-9]{64})$/);if(!match)throw Error('not found');if(req.headers.origin&&!sameOrigin(req.headers.origin,origin(req)))throw Error('origin forbidden');const sid=u.searchParams.get('sid'),s=recoverSession(sid);if(!s||!live(s))throw Error('session invalid');const a=await attach(s,sid);if(a.room.key!==match[1])throw Error('room forbidden');
    wss.handleUpgrade(req,socket,head,ws=>{const r=a.room;ws.sid=sid;ws.canWrite=a.canWrite;ws.identity=identity(s,a.info);ws.alive=true;r.connections.add(ws);r.lastSeen=Date.now();
     ws.on('pong',()=>ws.alive=true);ws.on('message',data=>{try{if(ws.explicitlyClosed||r.releasing)return;if(!live(s))return ws.close(4401,'session expired');s.lastSeen=r.lastSeen=Date.now();const d=dec.createDecoder(new Uint8Array(data)),type=dec.readVarUint(d);
      if(type===0){const kind=dec.readVarUint(d);if(kind===sync.messageYjsSyncStep1){const sv=dec.readVarUint8Array(d);ws.send(packet(0,e=>sync.writeSyncStep2(e,r.doc,sv)));}
@@ -154,7 +160,7 @@ function createCollaboration({server,sessions,live,checkInfo,getContents,lock,re
      // A clean client-initiated close (tab close without beacon, or explicit disconnect) is an
      // intentional editor exit: 1000 carries an explicit code, 1005 means close frame without one.
      // Abnormal drops (1006, heartbeat terminate, protocol rejects) keep the reconnect grace.
-     if((code===1000||code===1005)&&ws.sid)r.members.delete(ws.sid);
+     if((code===1000||code===1005)&&ws.sid&&![...r.connections].some(c=>c.sid===ws.sid))r.members.delete(ws.sid);
      if(!r.members.size&&!r.connections.size&&!r.attaching&&!r.releasing&&(r.explicitLeave||code===1000||code===1005)){r.explicitLeave=true;void retire(r,'explicit').catch(()=>{});}
     });
     ws.send(packet(0,e=>sync.writeSyncStep1(e,r.doc)));ws.send(packet(1,e=>enc.writeVarUint8Array(e,awareness.encodeAwarenessUpdate(r.awareness,Array.from(r.awareness.getStates().keys())))));sendStatus(r,ws);

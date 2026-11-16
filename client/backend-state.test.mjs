@@ -6,3 +6,18 @@ test('recovery key stable across token rotation but scoped to user, host and fil
 test('host capabilities are explicit, readonly trumps write flag',()=>{const s={wopisrc:'https://x.test/files/1'};assert.equal(fileMetadata(s,{UserId:'A',ReadOnly:true,UserCanWrite:true}).canWrite,false);assert.equal(fileMetadata(s,{UserCanNotWriteRelative:false}).capabilities.relativeWrite,true);assert.equal(fileMetadata(s,{}).capabilities.directoryList,false);});
 test('lease renewal obeys presence, lock, expiry and next-deadline',()=>{const s={lockId:'l',created:1000,lastSeen:2000,ttl:90000,nextRefresh:3000};assert.equal(shouldRenew(s,4000,12000),true);for(const patch of [{lockId:null},{lockFailed:true},{closing:true},{ttl:3000},{lastSeen:-20000},{nextRefresh:5000}])assert.equal(shouldRenew({...s,...patch},4000,12000),false);});
 test('refresh failures map to fail-closed conflict or permission errors',()=>{assert.equal(refreshError(409).status,409);assert.equal(refreshError(401).status,403);assert.equal(refreshError(500).status,502);});
+
+import fs from 'node:fs';import os from 'node:os';import path from 'node:path';
+test('private session records survive reconstruction but never extend expired credentials',()=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'wopi-session-')),sid='a'.repeat(32),record={wopisrc:'https://host.test/wopi/1',token:'synthetic-test-only',ttl:Date.now()+10000,created:Date.now()};
+ try{
+ const store=state.sessionStore(dir);store.save(sid,record);const loaded=state.sessionStore(dir).load(sid);
+ assert.equal(loaded.token,record.token);assert.equal(loaded.ttl,record.ttl);
+ const file=path.join(dir,'sessions',sid+'.json');assert.equal(fs.statSync(file).mode&0o777,0o600);assert.equal(fs.statSync(path.dirname(file)).mode&0o777,0o700);
+ assert.equal(store.load('../bad'),null);assert.equal(store.load('b'.repeat(32)),null);
+ store.save(sid,{...record,ttl:Date.now()-1});assert.equal(store.load(sid),null);
+ store.save(sid,{...record,created:Date.now()-13*3600000});assert.equal(store.load(sid),null);
+ fs.writeFileSync(file,'{broken');assert.equal(store.load(sid),null);
+ store.save(sid,record);fs.chmodSync(file,0o644);assert.equal(store.load(sid),null);
+ }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});

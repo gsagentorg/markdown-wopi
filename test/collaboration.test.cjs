@@ -6,12 +6,13 @@ const listen=s=>new Promise(resolve=>s.listen(0,'127.0.0.1',()=>resolve(s.addres
 const request=(url,opt={})=>new Promise((resolve,reject)=>{const body=opt.body==null?null:Buffer.from(String(opt.body));const headers={...opt.headers};if(body)headers['Content-Length']=body.length;const req=http.request(url,{method:opt.method||'GET',headers},res=>{const chunks=[];res.on('data',b=>chunks.push(b));res.on('end',()=>resolve({status:res.statusCode,headers:res.headers,body:Buffer.concat(chunks).toString(),json(){return JSON.parse(this.body);}}));});req.setTimeout(8000,()=>req.destroy(Error('test request timeout')));req.on('error',reject);if(body)req.write(body);req.end();});
 async function until(check,emitter,event,timeout=8000){if(check())return;await new Promise((resolve,reject)=>{const stop=()=>{clearTimeout(timer);clearInterval(poll);emitter.off(event,done);};const done=()=>{if(check()){stop();resolve();}};const timer=setTimeout(()=>{stop();reject(Error('condition timed out: '+event));},timeout),poll=setInterval(done,100);emitter.on(event,done);});}
 async function harness(t,options={}){
- const events=new EventEmitter(),files=new Map([['1','# Shared\r\n原文'],['2','# Other\n']]),records={locks:0,refresh:0,puts:[],pending:[],hold:false,failRefresh:false};let locked='';
+ const events=new EventEmitter(),files=new Map([['1','# Shared\r\n原文'],['2','# Other\n']]),records={locks:0,refresh:0,puts:[],pending:[],hold:false,failRefresh:false};let locked='';Object.defineProperty(records,'locked',{get:()=>locked,set:value=>{locked=value;}});
  const host=http.createServer((req,res)=>{const u=new URL(req.url,'http://test'),grant=u.searchParams.get('access_token'),id=u.pathname.split('/')[2];if(!['writer-a','writer-b','reader','reader-old'].includes(grant)){res.writeHead(401).end();return;}
+  if(records.deny)return res.writeHead(403).end();if(records.transient)return res.writeHead(503).end();
   if(req.method==='GET'&&u.pathname.endsWith('/contents'))return res.end(files.get(id)||'');
   if(req.method==='GET'){res.setHeader('Content-Type','application/json');return res.end(JSON.stringify({BaseFileName:id+'.md',UserId:grant,UserFriendlyName:grant,UserCanWrite:!grant.startsWith('reader'),ReadOnly:grant.startsWith('reader'),Version:grant==='reader-old'?'v0':'v1'}));}
   const op=req.headers['x-wopi-override'];if(op==='LOCK'){records.locks++;if(locked&&locked!==req.headers['x-wopi-lock'])return res.writeHead(409).end();locked=req.headers['x-wopi-lock'];return res.end();}
-  if(op==='REFRESH_LOCK'){records.refresh++;return res.writeHead(records.failRefresh?409:200).end();}
+  if(op==='REFRESH_LOCK'){records.refresh++;return res.writeHead(records.failRefresh||!locked||locked!==req.headers['x-wopi-lock']?409:200).end();}
   if(op==='UNLOCK'){locked='';return res.end();}
   if(op==='PUT'){const chunks=[];req.on('data',b=>chunks.push(b));req.on('end',()=>{const b=Buffer.concat(chunks);assert.equal(Number(req.headers['content-length']),b.length);const item={id,text:b.toString(),grant,lock:req.headers['x-wopi-lock']};records.puts.push(item);const finish=()=>{files.set(id,item.text);res.end();events.emit('saved');};if(records.hold)records.pending.push(finish);else finish();events.emit('put');});return;}
   res.writeHead(501).end();
@@ -19,7 +20,7 @@ async function harness(t,options={}){
  const hostPort=await listen(host),reserve=http.createServer(),port=await listen(reserve);await new Promise(r=>reserve.close(r));
  const dir=options.dir||fs.mkdtempSync(path.join(os.tmpdir(),'wopi-monaco-test-'));const clients=[];let child,output='';
  async function start(){child=spawn(process.execPath,['server.js'],{cwd:root,env:{...process.env,PORT:String(port),BASE_URL:'http://127.0.0.1:'+port,COLLAB_DATA_DIR:dir,COLLAB_SAVE_MS:'500',COLLAB_GRACE_MS:'60000',LOCK_REFRESH_MS:'1000'},stdio:['ignore','pipe','pipe']});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('start timeout '+output)),5000);child.stdout.on('data',x=>{output+=x;if(output.includes('listening')){clearTimeout(timer);resolve();}});child.stderr.on('data',x=>output+=x);child.once('exit',code=>reject(Error('server exit '+code+' '+output)));});}
- async function stop(){if(!child)return;const c=child;child=null;c.kill('SIGTERM');await once(c,'exit');output='';}
+ async function stop(signal='SIGTERM'){if(!child)return;const c=child;child=null;c.kill(signal);await once(c,'exit');output='';}
  await start();
  const base='http://127.0.0.1:'+port;
  async function session(grant='writer-a',id='1',expectedStatus=200){const form=new URLSearchParams({access_token:grant});const r=await request(base+'/wopi/edit?WOPISrc='+encodeURIComponent('http://127.0.0.1:'+hostPort+'/files/'+id),{method:'POST',body:form.toString(),headers:{'Content-Type':'application/x-www-form-urlencoded'}});assert.equal(r.status,303);assert.match(r.headers.location,/monaco-editor/);const sid=new URLSearchParams(r.headers.location.split('#')[1]).get('s');const loaded=await request(base+'/api/doc/'+sid);assert.equal(loaded.status,expectedStatus,loaded.body);return {sid,data:loaded.json(),status:loaded.status};}
@@ -35,3 +36,68 @@ test('disconnect/reconnect merges offline changes and does not duplicate seed te
 test('server restart restores CRDT journal while external file divergence blocks overwrite',{timeout:20000},async t=>{const h=await harness(t),a=await h.session(),x=await h.connect(a);x.doc.getText('markdown').insert(0,'persist');x.provider.ws.send(new Uint8Array([5]));await until(()=>!x.status.dirty&&h.files.get('1').startsWith('persist'),x.events,'status');x.provider.disconnect();await h.stop();h.files.set('1','EXTERNAL CHANGE');await h.start();const next=await h.session();assert.equal(next.data.canWrite,false);assert.match(next.data.collab.status.blocked,/external-file-changed/);assert.equal(h.files.get('1'),'EXTERNAL CHANGE');assert.ok(next.data.content.startsWith('persist'));});
 
 test('historical WOPI version cannot join or overwrite the active live room',{timeout:15000},async t=>{const h=await harness(t);await h.session();const old=await h.session('reader-old','1',409);assert.match(old.data.error,/version differs/);assert.equal(h.records.puts.length,0);assert.equal(h.files.get('1'),'# Shared\r\n原文');});
+
+test('same sid and existing Y.Doc recover after actual crash with journal, offline edits and owned lock intact',{timeout:20000},async t=>{
+ const h=await harness(t),a=await h.session(),x=await h.connect(a);
+ x.doc.getText('markdown').insert(0,'JOURNAL-');
+ await until(()=>x.status.dirty,x.events,'status');
+ await h.stop('SIGKILL');x.provider.disconnect();
+ x.doc.getText('markdown').insert(0,'OFFLINE-');
+ const before=x.doc;
+ await h.start();
+ const [r1,r2]=await Promise.all([request(h.base+'/api/doc/'+a.sid),request(h.base+'/api/doc/'+a.sid)]);
+ assert.equal(r1.status,200,r1.body);assert.equal(r2.status,200,r2.body);
+ assert.equal(r1.json().canWrite,true);assert.equal(r1.json().collab.roomId,a.data.collab.roomId);
+ assert.equal(h.records.locks,1,'owned lock is refreshed, not replaced or stolen');
+ assert.ok(!r1.body.includes('access_token'),'credential fields must remain server-only');assert.equal(r1.json().token,undefined);
+ x.provider.connect();await until(()=>x.provider.synced,x.provider,'sync');
+ assert.equal(x.doc,before,'existing document identity is preserved');
+ x.provider.ws.send(new Uint8Array([5]));
+ const expected='OFFLINE-JOURNAL-# Shared\r\n原文';
+ await until(()=>h.files.get('1')===expected,h.events,'saved');
+ assert.equal(x.doc.getText('markdown').toString(),'OFFLINE-JOURNAL-# Shared\n原文');
+});
+test('reopened persisted sessions revalidate auth, distinguish outages and fail closed on missing or corrupt records',{timeout:20000},async t=>{
+ const h=await harness(t),a=await h.session();await h.stop();await h.start();
+ h.records.transient=true;assert.equal((await request(h.base+'/api/doc/'+a.sid)).status,502);
+ h.records.transient=false;h.records.deny=true;assert.equal((await request(h.base+'/api/doc/'+a.sid)).status,403);
+ h.records.deny=false;const r=await request(h.base+'/api/doc/'+a.sid);assert.equal(r.status,200,r.body);
+ await h.stop();const file=path.join(h.dir,'sessions',a.sid+'.json');fs.writeFileSync(file,'{bad');await h.start();assert.equal((await request(h.base+'/api/doc/'+a.sid)).status,404);
+ await h.stop();fs.rmSync(file,{force:true});await h.start();assert.equal((await request(h.base+'/api/doc/'+a.sid)).status,404);
+ const launch=await request(h.base+'/wopi/edit?WOPISrc='+encodeURIComponent('http://127.0.0.1:'+h.hostPort+'/files/1'),{method:'POST',body:new URLSearchParams({access_token:'writer-a',access_token_ttl:String(Date.now()-1)}).toString()});assert.equal(launch.status,401,'expired launch must never receive a fresh hour');
+});
+
+test('restart reacquires only a lost owned lock and never adopts a foreign holder',{timeout:20000},async t=>{
+ const h=await harness(t),a=await h.session();const owned=h.records.locked;
+ await h.stop('SIGKILL');h.records.locked='';await h.start();
+ let r=await request(h.base+'/api/doc/'+a.sid);assert.equal(r.status,200,r.body);assert.equal(r.json().canWrite,true);assert.equal(h.records.locked,owned);assert.equal(h.records.locks,2);
+ await h.stop('SIGKILL');h.records.locked='foreign-holder';await h.start();
+ r=await request(h.base+'/api/doc/'+a.sid);assert.equal(r.status,200,r.body);assert.equal(r.json().canWrite,false);assert.equal(r.json().collab.status.blocked,'external-lock');assert.equal(h.records.locked,'foreign-holder');assert.equal(h.records.puts.length,0);
+});
+test('duplicate sid sockets keep membership and lock until the last attachment leaves',{timeout:15000},async t=>{
+ const h=await harness(t),a=await h.session(),x=await h.connect(a),y=await h.connect(a);x.provider.disconnect();
+ y.doc.getText('markdown').insert(0,'SURVIVES-');y.provider.ws.send(new Uint8Array([5]));
+ await until(()=>h.files.get('1').startsWith('SURVIVES-'),h.events,'saved');assert.equal(h.records.locks,1);assert.ok(h.records.locked);
+});
+test('persisted absolute expiry is honored after actual server restart',{timeout:15000},async t=>{
+ const h=await harness(t),a=await h.session();await h.stop();const file=path.join(h.dir,'sessions',a.sid+'.json'),record=JSON.parse(fs.readFileSync(file));record.ttl=Date.now()-1;fs.writeFileSync(file,JSON.stringify(record));await h.start();assert.equal((await request(h.base+'/api/doc/'+a.sid)).status,404);assert.equal(fs.existsSync(file),false,'expired credentials are removed');
+});
+
+test('lost or incomplete CRDT journal refuses old sid instead of reseeding and duplicating content',{timeout:20000},async t=>{
+ const h=await harness(t),a=await h.session();await h.stop();
+ const room=path.join(h.dir,a.data.collab.roomId);fs.unlinkSync(path.join(room,'state.bin'));await h.start();
+ let r=await request(h.base+'/api/doc/'+a.sid);assert.equal(r.status,503,r.body);assert.match(r.json().error,/missing snapshot/);
+ await h.stop();fs.rmSync(room,{recursive:true});await h.start();r=await request(h.base+'/api/doc/'+a.sid);assert.equal(r.status,409,r.body);assert.match(r.json().error,/identity lost/);assert.equal(h.files.get('1'),'# Shared\r\n原文');
+});
+
+test('frontend recovery controller automatically reattaches existing provider after backend restart, draft first',{timeout:20000},async t=>{
+ const {recoverSession,watchSessionRecovery}=await import('../client/src/presence.js');
+ const h=await harness(t),a=await h.session(),x=await h.connect(a),original=x.doc,order=[];
+ let protectedText='',reconnected=0;
+ const recovery=recoverSession({flush(){protectedText=x.doc.getText('markdown').toString();order.push('draft');},async reopen(){order.push('request');const r=await request(h.base+'/api/doc/'+a.sid);return {ok:r.status===200,status:r.status,json:async()=>r.json()};},reconnect(data){assert.equal(data.collab.epoch,a.data.collab.epoch);reconnected++;x.provider.connect();},onTerminal:()=>assert.fail('live session must recover'),onTransient(){}});
+ const unwatch=watchSessionRecovery({provider:x.provider,recover(){x.provider.disconnect();void recovery.recover();},terminal:()=>assert.fail('not expired')});t.after(()=>{unwatch();recovery.stop();});
+ await h.stop('SIGKILL');x.doc.getText('markdown').insert(0,'AUTO-OFFLINE-');await h.start();
+ await until(()=>reconnected>0&&x.provider.synced,x.provider,'sync');
+ assert.equal(x.doc,original);assert.ok(protectedText.startsWith('AUTO-OFFLINE-'));assert.deepEqual(order.slice(0,2),['draft','request']);
+ x.provider.ws.send(new Uint8Array([5]));await until(()=>h.files.get('1')==='AUTO-OFFLINE-# Shared\r\n原文',h.events,'saved');
+});

@@ -7,3 +7,34 @@ test('preview worker discards stale results and never changes source',()=>{const
 test('worker-unavailable browsers retain a safe functional preview',()=>{const rendered=[];const p=createPreviewPipeline({render:h=>rendered.push(h),fallback:s=>'html:'+s,workerFactory:()=>{throw Error('disabled');}});p.update('source');assert.deepEqual(rendered,['html:source']);p.destroy();});
 
 test('worker failing after launch immediately renders the current source via fallback',()=>{const rendered=[],worker={postMessage(){},terminate(){}};const p=createPreviewPipeline({render:h=>rendered.push(h),fallback:s=>'html:'+s,workerFactory:()=>worker});p.update('current');worker.onerror();assert.deepEqual(rendered,['html:current']);p.destroy();});
+
+import {recoverSession} from './src/presence.js';
+test('recovery protects drafts first, coalesces callers and tolerates transient failures',async()=>{
+ const timers=new Clock(),order=[];let calls=0,restored;
+ const x=recoverSession({timers,flush:()=>order.push('draft'),reopen:async()=>{order.push('request');return ++calls===1?{status:503,ok:false}:{status:200,ok:true,json:async()=>({ok:true,canWrite:false,collab:{status:{blocked:'external-lock'}}})};},reconnect:d=>restored=d,onTerminal:()=>assert.fail('transient is not expired'),onTransient:()=>{}});
+ const a=x.recover(),b=x.recover();assert.equal(a,b);await flush();assert.deepEqual(order,['draft','request']);assert.equal(timers.run(),1000);await a;
+ assert.equal(calls,2);assert.equal(restored.canWrite,false);assert.equal(restored.collab.status.blocked,'external-lock');assert.deepEqual(order,['draft','request','draft','request']);x.stop();
+});
+test('recovery stops on terminal auth and disposal ignores in-flight responses',async()=>{
+ for(const status of [401,403,404,410]){let calls=0,terminal=0;const x=recoverSession({flush(){},reopen:async()=>{calls++;return {status};},reconnect:()=>assert.fail(),onTerminal:()=>terminal++,onTransient:()=>assert.fail()});await x.recover();await x.recover();assert.equal(calls,1);assert.equal(terminal,1);}
+ let resolve;const x=recoverSession({flush(){},reopen:()=>new Promise(r=>resolve=r),reconnect:()=>assert.fail('disposed'),onTerminal:()=>assert.fail(),onTransient:()=>assert.fail()});const p=x.recover();x.stop();resolve({ok:true,status:200,json:async()=>({ok:true})});await p;
+});
+test('recovery retries are bounded and disposal cancels backoff',async()=>{
+ const timers=new Clock();let calls=0;const x=recoverSession({timers,attempts:2,flush(){},reopen:async()=>{calls++;throw Error('offline');},reconnect:()=>assert.fail(),onTerminal:()=>assert.fail(),onTransient(){}});const p=x.recover();await flush();timers.run();await p;assert.equal(calls,2);assert.equal(timers.tasks.size,0);
+ x.reset();const q=x.recover();await flush();x.stop();await q;assert.equal(timers.tasks.size,0);
+});
+
+test('successful HTTP reopen without protocol sync cannot reset reconnect budget',async()=>{
+ let calls=0;const x=recoverSession({attempts:2,flush(){},reopen:async()=>{calls++;return {ok:true,status:200,json:async()=>({ok:true})};},reconnect(){},onTerminal:()=>assert.fail(),onTransient:()=>assert.fail()});await x.recover();await x.recover();await x.recover();assert.equal(calls,2);x.reset();await x.recover();assert.equal(calls,3);x.stop();
+});
+
+import {EventEmitter} from 'node:events';import {watchSessionRecovery} from './src/presence.js';
+test('provider recovery includes graceful server closes but ignores reentrant local disconnects',()=>{
+ const provider=new EventEmitter();provider.shouldConnect=true;let calls=0,terminals=0;
+ provider.disconnect=()=>{provider.shouldConnect=false;provider.emit('connection-close',null);};
+ const stop=watchSessionRecovery({provider,recover(){calls++;provider.disconnect();},terminal(){terminals++;provider.disconnect();}});
+ provider.emit('connection-close',{code:1000});assert.equal(calls,1);
+ provider.shouldConnect=true;provider.emit('connection-error',{});assert.equal(calls,2);
+ provider.shouldConnect=true;provider.emit('connection-close',{code:4401});assert.equal(terminals,1);assert.equal(calls,2);
+ stop();provider.shouldConnect=true;provider.emit('connection-close',{code:1006});assert.equal(calls,2);
+});

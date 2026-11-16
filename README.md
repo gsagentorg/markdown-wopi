@@ -20,7 +20,7 @@
 
 ```
 Cloudreve ──form POST(access_token)──▶ /wopi/edit (shim)
-                                        │ 建立 128-bit sid，token 只留在服务端内存
+                                        │ 建立 128-bit sid，token 只留在服务端私密状态
                                         ▼
                               /static/monaco-editor.html#s=<sid>
                                         │
@@ -55,7 +55,7 @@ PORT=3001 BASE_URL=http://127.0.0.1:3001 npm start
 | `BIND` | 绑定地址 | `127.0.0.1` |
 | `BASE_URL` | 对外基址，用于 Origin 校验与 discovery | 由请求 Host 推断 |
 | `ALLOWED_ORIGINS` | 允许的额外来源，逗号分隔 | 空 |
-| `COLLAB_DATA_DIR` | 协作 journal 持久目录 | `./.runtime/rooms` |
+| `COLLAB_DATA_DIR` | 协作 journal 与私密会话恢复记录目录（必须持久挂卷） | `./.runtime/rooms` |
 | `COLLAB_SAVE_MS` | 自动保存延迟 | `1000` |
 | `COLLAB_GRACE_MS` | 断线宽限期 | `15000` |
 | `LOCK_REFRESH_MS` | 锁续期间隔 | `240000` |
@@ -198,7 +198,7 @@ curl -s https://wopi.example.com:3443/markdown/hosting/discovery | grep -c '<app
 ## 测试
 
 ```bash
-npm test        # 101 项：单元 + 真实 HTTP 替身 + 锁生命周期 + MOCK 宿主 + 预览/草稿/主题/语法守卫
+npm test        # 单元/集成：单元 + 真实 HTTP 替身 + 锁生命周期 + MOCK 宿主 + 预览/草稿/主题/语法守卫
 npm run build   # 测试 + 构建 + 入口资源校验
 ```
 
@@ -206,8 +206,11 @@ npm run build   # 测试 + 构建 + 入口资源校验
 
 ## 安全与边界
 
-- WOPI `access_token` 只在服务端内存中使用，不写入日志、不返回前端；前端只拿随机 sid。
-- 会话仅存内存：服务重启后所有 sid 失效，必须从宿主重新打开。
+- WOPI `access_token` 仅在服务端使用：恢复记录默认存于 `COLLAB_DATA_DIR/sessions/`，目录 0700、记录原子替换且 0600，拒绝非本用户文件、符号链接和不安全权限。不写入日志、不返回前端、不进入浏览器 URL/localStorage；前端仍只拿随机 sid。此目录现在包含有效凭据，备份与卷访问必须同样私密，不得入库或公开挂载。
+- 后端重启后，同一个 sid 可在原始绝对期限内恢复；每次 HTTP/WS attach 都重新调用宿主 CheckFileInfo 校验当前权限。已过期的明确 TTL 不会被补成新的一小时；未给 TTL/给 0 保留原有一次性一小时上限，且所有会话总寿命不超过最初创建起 12 小时。过期或不合法的磁盘记录启动时及每分钟清理。
+- 房间 journal 保存 CRDT epoch 与本方锁意图。重启先刷新已知本方锁；只有宿主明确返回锁丢失（409）才尝试用同一锁值重新 LOCK，绝不采用对方回显的锁。缺失快照、损坏 journal、CRDT 身份丢失或云端分歧时安全拒绝/只读，不能自动重建正文再合并旧客户端而造成重复或覆盖。
+- 浏览器恢复前同步 flush 本机草稿，最多 5 次单飞恢复尝试，退避 1/2/4/8 秒；只有协议同步成功才重置预算。成功时复用原 Monaco/Y.Doc，通过 Yjs 状态向量合并，不全文替换、不整页 reload。401/403/404/410 停止自动恢复；网络/5xx/冲突不误标为 token 过期。耗尽预算后保留正文和下载能力，须从宿主重开；本机存储不可用/额度不足时既有提示与下载兜底仍然适用。
+- 此恢复仅适用于本版本建立且私密状态完整的会话；升级前的纯内存 sid 不可恢复。单进程、同一持久目录是前提；原子替换不等于断电事务保证，强杀进程测试不代表电源故障、多实例或真实宿主全权限验收。
 - 单个房间只持一把宿主锁；保存走服务端串行化，浏览器不直接整文覆盖。
 - 单进程部署；多实例、跨账号/团队/分享权限组合、真实长 TTL 与撤权、IME 全设备矩阵尚未完整验收。
 - 对外部署建议置于反向代理后并启用 HTTPS，仅暴露必要路由。

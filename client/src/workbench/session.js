@@ -12,7 +12,7 @@ import {createPreviewPipeline} from '../preview-pipeline.js';
 import {registerMarkdown} from '../monaco-features.js';
 import {connectMonacoPreview} from '../monaco-preview-sync.js';
 import {imageMarkdown} from '../embedded-images-core.js';
-import {keepSession} from '../presence.js';
+import {keepSession,recoverSession,watchSessionRecovery} from '../presence.js';
 import {createRecoveryController} from './recovery-controller.js';
 import {activeHeading,mayReload} from './state.js';
 import {demoDocument} from './demo.js';
@@ -23,7 +23,7 @@ globalThis.MonacoEnvironment={getWorker:()=>new Worker(appUrl('static/monaco/edi
 // React owns views. This controller owns exactly one Monaco/Y.Doc/provider lifecycle.
 export function mountSession({editorHost,previewHost,store}){
  const params=new URLSearchParams(location.hash.slice(1)),query=new URLSearchParams(location.search),sid=params.get('s'),demo=query.get('demo')==='1';
- let editor,model,provider,ydoc,binding,undo,recovery,pipeline,previewSync,features,presence,data,lastStatus={},closed=false,initialSynced=false,authorized=false,renderToken=0,timer,themeCleanup,allowUnload=false;
+ let editor,model,provider,ydoc,binding,undo,recovery,pipeline,previewSync,features,presence,sessionRecovery,data,lastStatus={},closed=false,initialSynced=false,authorized=false,renderToken=0,timer,themeCleanup,allowUnload=false;
  const disposables=[],cleanups=[],fetchAbort=new AbortController();
  const snapshot=()=>store.getSnapshot(),notice=text=>!closed&&store.set({notice:text}),serialize=()=>model?.getValue().replace(/\n/g,data?.eol||'\n')||'';
  function readOnly(){const ro=!canEdit({authorized,blocked:!!lastStatus.blocked,initialSynced,pendingRecovery:recovery?.pending||snapshot().recovery?.pending});editor?.updateOptions({readOnly:ro});store.set({readOnly:ro,authorized});}
@@ -72,11 +72,20 @@ export function mountSession({editorHost,previewHost,store}){
   if(!demo){try{pruneDrafts(globalThis.localStorage);}catch{}}
   if(!demo)recovery=createRecoveryController({key:data.draftKey,cloudText:data.content,onState(value){store.set({recovery:value});readOnly();},onRestore(text){editor.executeEdits('restore-draft',[{range:model.getFullModelRange(),text:text.replace(/\r\n/g,'\n'),forceMoveMarkers:true}]);editor.focus();},onNotice:notice,download,canRestore:()=>model.getValue()===initial});
   if(provider){
-   provider.on('sync',synced=>{if(closed)return;if(synced)initialSynced=true;store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
+   provider.on('sync',synced=>{if(closed)return;if(synced){initialSynced=true;sessionRecovery?.reset();}store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
    provider.on('status',e=>{if(closed)return;store.set({connected:e.status==='connected'});if(e.status!=='connected'&&initialSynced)notice('连接断开，本地修改保留并等待合并');readOnly();void renderStatus(lastStatus);});
-   provider.on('connection-close',e=>{if(closed)return;if(e?.code>=4400&&e.code<4500){authorized=false;lastStatus={...lastStatus,expired:true};recovery.flush();readOnly();store.set({banner:'会话已过期，已切换为只读；修改已保留在本机草稿。可下载当前内容，或从 Cloudreve 重新打开后恢复草稿。',bannerKind:'session'});}});
+   const terminal=event=>{if(event?.code===4403&&(!authorized||lastStatus.blocked)){recovery.flush();provider.disconnect();sessionRecovery?.stop();readOnly();notice('房间已变为只读或存在冲突，本地修改仍保留，请下载副本后处理');return;}authorized=false;lastStatus={...lastStatus,expired:true};recovery.flush();provider.disconnect();sessionRecovery?.stop();readOnly();store.set({banner:'会话已过期或权限被拒绝，已切换为只读；修改已保留在本机草稿。请下载副本或从 Cloudreve 重新打开。',bannerKind:'session'});};
+   sessionRecovery=recoverSession({flush:()=>recovery.flush(),reopen:()=>fetch(appUrl('api/doc/'+encodeURIComponent(sid)),{signal:fetchAbort.signal}),reconnect(next){
+    if(closed)return;
+    if(next.collab?.roomId!==data.collab.roomId||next.collab?.epoch!==data.collab.epoch){notice('恢复房间不匹配，已保留本机草稿');return;}
+    authorized=!!next.canWrite;lastStatus=next.collab.status;data={...data,...next};
+    // Never seed or replace the model: protocol state vectors merge into this Y.Doc.
+    provider.connect();readOnly();void renderStatus(lastStatus);
+   },onTerminal:terminal,onTransient(){notice('连接暂时不可用，草稿已保留；正在尝试恢复会话');},onExhausted(){notice('自动恢复次数已用尽，本地正文仍保留；请下载副本或从 Cloudreve 重新打开');}});
+   const recover=()=>{if(closed||lastStatus.expired)return;recovery.flush();provider.disconnect();void sessionRecovery.recover();};
+   cleanups.push(watchSessionRecovery({provider,recover,terminal,isClosed:()=>closed}));
    provider.awareness.on('change',refreshPeers);provider.awareness.setLocalStateField('user',data.collab.user);lastStatus=data.collab.status;provider.connect();
-   presence=keepSession({ping:()=>fetch(appUrl('api/keepalive/'+sid),{method:'POST'}),onLost(){authorized=false;lastStatus={...lastStatus,expired:true};recovery.flush();readOnly();store.set({banner:'会话或文件锁已失效，已切换为只读；修改已保留在本机草稿。可下载当前内容，或从 Cloudreve 重新打开后恢复。',bannerKind:'session'});},onNotice:notice,interval:240000});
+   presence=keepSession({ping:()=>fetch(appUrl('api/keepalive/'+sid),{method:'POST'}),onLost(status){if([401,403,404].includes(status))terminal();else recover();},onNotice:notice,interval:240000});
   }else {initialSynced=true;store.set({initialSynced:true});analyze();position();}
   if(!authorized)store.set({banner:data.lockedByOther?'文件由外部编辑器持锁。当前以只读方式查看共享内容。':'当前 Cloudreve 会话为只读，可以实时查看但不能修改。'});
   store.set({phase:'ready',authorized,status:{...lastStatus}});readOnly();
@@ -88,8 +97,8 @@ export function mountSession({editorHost,previewHost,store}){
  }
  const beforeUnload=e=>{if(allowUnload)return;if(controller.hasUnsaved()){recovery?.flush();e.preventDefault();e.returnValue='';}};
  const pageHide=e=>{if(e.persisted){recovery?.flush();provider?.disconnect();}else destroy();};
- const pageShow=e=>{if(e.persisted&&!closed)provider?.connect();};
+ const pageShow=e=>{if(e.persisted&&!closed){recovery?.flush();void sessionRecovery?.recover();}};
  window.addEventListener('beforeunload',beforeUnload);window.addEventListener('pagehide',pageHide);window.addEventListener('pageshow',pageShow);
- function destroy(){if(closed)return;closed=true;renderToken++;fetchAbort.abort();clearTimeout(timer);presence?.stop();recovery?.destroy();provider?.destroy();binding?.destroy();undo?.destroy();disposables.forEach(d=>d.dispose());cleanups.forEach(fn=>fn());pipeline?.destroy();previewSync?.destroy();features?.destroy();themeCleanup?.();editor?.dispose();model?.dispose();ydoc?.destroy();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('pagehide',pageHide);window.removeEventListener('pageshow',pageShow);if(!demo&&sid)try{navigator.sendBeacon(appUrl('api/unlock/'+sid));}catch{}if(globalThis.__wopiQA===controller)delete globalThis.__wopiQA;}
+ function destroy(){if(closed)return;closed=true;renderToken++;fetchAbort.abort();clearTimeout(timer);presence?.stop();sessionRecovery?.stop();recovery?.destroy();provider?.destroy();binding?.destroy();undo?.destroy();disposables.forEach(d=>d.dispose());cleanups.forEach(fn=>fn());pipeline?.destroy();previewSync?.destroy();features?.destroy();themeCleanup?.();editor?.dispose();model?.dispose();ydoc?.destroy();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('pagehide',pageHide);window.removeEventListener('pageshow',pageShow);if(!demo&&sid)try{navigator.sendBeacon(appUrl('api/unlock/'+sid));}catch{}if(globalThis.__wopiQA===controller)delete globalThis.__wopiQA;}
  controller.ready=start().catch(e=>{if(!closed)store.set({phase:'error',banner:e.message});});return controller;
 }

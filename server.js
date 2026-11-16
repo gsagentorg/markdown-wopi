@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const https = require('node:https');
-const {fileMetadata,refreshError}=require('./server-state.cjs');
+const {fileMetadata,refreshError,sessionStore}=require('./server-state.cjs');
 const {createCollaboration}=require('./collaboration.cjs');
 const RENEW_MS=Math.max(1000,Number(process.env.LOCK_REFRESH_MS)||240000);
 const PRESENCE_MS=12*60000;
@@ -56,14 +56,17 @@ const MOCK_FILE = process.env.MOCK_FILE || path.join(__dirname, 'mock-data.md');
 let mockLock = '';
 const MAX_BODY = 20 * 1024 * 1024;
 
-// 会话仅在内存：sid -> { wopisrc, token, ttl, created, lockId, lockFailed }
+// Private server-side session records survive restart without exposing credentials.
 // access_token 全程不出服务端；编辑器只拿随机 sid。
 const sessions = new Map();
+const dataDir=process.env.COLLAB_DATA_DIR||path.join(__dirname,'.runtime','rooms');
+const persistedSessions=sessionStore(dataDir);
+function recoverSession(sid){let s=sessions.get(sid);if(!s){s=persistedSessions.load(sid);if(s)sessions.set(sid,s);}return s;}
 
 const newSid = () => crypto.randomBytes(24).toString('base64url');
-const live = (s) => Date.now() <= Math.min(s.ttl, s.created + 12 * 3600 * 1000);
+const live = (s) => Date.now() < Math.min(s.ttl, s.created + 12 * 3600 * 1000);
 let collaboration;
-setInterval(()=>{for(const [sid,session] of sessions)if(!live(session)){void collaboration?.leave(sid).catch(()=>{});sessions.delete(sid);}},60000).unref();
+setInterval(()=>{persistedSessions.prune();for(const [sid,session] of sessions)if(!live(session)){void collaboration?.leave(sid).catch(()=>{});sessions.delete(sid);}},60000).unref();
 
 function log(sid, method, p, status) {
   console.log(new Date().toISOString(), (sid || '-').slice(0, 8), method, p, status);
@@ -124,22 +127,23 @@ const withToken = (s, suffix) => {
 
 async function wopiCheckFileInfo(s) {
   const r = await upstream(withToken(s));
-  if (!r.ok) throw Object.assign(new Error('checkfileinfo HTTP ' + r.status), { status: 502 });
+  if (!r.ok) throw Object.assign(new Error('checkfileinfo HTTP ' + r.status), { status: [401,403].includes(r.status)?r.status:502 });
   const j = await r.json();
   const info=fileMetadata(s,j); s.fileInfo=info; return info;
 }
 
 async function wopiGetContents(s) {
   const r = await upstream(withToken(s, '/contents'));
-  if (!r.ok) throw Object.assign(new Error('getfile HTTP ' + r.status), { status: 502 });
+  if (!r.ok) throw Object.assign(new Error('getfile HTTP ' + r.status), { status: [401,403].includes(r.status)?r.status:502 });
   return await r.text();
 }
 
 async function wopiLock(s) {
-  const lockId = crypto.randomBytes(16).toString('hex');
+  const lockId = s.pendingLockId || s.recoveryLockId || crypto.randomBytes(16).toString('hex');
+  if(s.recoveryLockId){s.lockId=lockId;s.closing=false;try{await wopiRefreshLock(s);s.recoveryLockId=null;return {ok:true};}catch(e){s.lockId=null;s.lockFailed=false;if(e.status!==409)throw e;}}
   const r = await upstream(withToken(s), { method: 'POST', headers: { 'X-WOPI-Lock': lockId, 'X-WOPI-Override': 'LOCK' } });
   if (r.status === 200) { s.lockId = lockId; s.closing=false; s.lastSeen=Date.now(); s.nextRefresh=Date.now()+RENEW_MS; return { ok: true }; }
-  if (r.status !== 409) throw Object.assign(new Error('lock HTTP ' + r.status), { status: 502 });
+  if (r.status !== 409) throw Object.assign(new Error('lock HTTP ' + r.status), { status: [401,403].includes(r.status)?r.status:502 });
   return { ok: false, conflict: true };
 }
 
@@ -245,7 +249,9 @@ async function handleShim(req, res, u) {
   if (!wopisrc) return void log(null, req.method, u.pathname, send(res, 400, { ok: false, error: 'WOPISrc required' }));
   if (!token) return void log(null, req.method, u.pathname, send(res, 400, { ok: false, error: 'access_token required' }));
   const sid = newSid();
-  sessions.set(sid, { wopisrc, token, ttl: ttl > Date.now() ? ttl : Date.now() + 3600e3, created: Date.now(), lockId: null, lockFailed: false });
+  if(!Number.isFinite(ttl)||ttl<0||(ttl>0&&ttl<=Date.now()))return void send(res,401,{ok:false,error:'session expired'});
+  const session={wopisrc,token,ttl:ttl>0?ttl:Date.now()+3600e3,created:Date.now(),lockId:null,lockFailed:false};
+  persistedSessions.save(sid,session);sessions.set(sid,session);
   // 旧的 ?ui=legacy 逃生门已删：它指向 CM6 时代的 editor 页面产物，那个文件早已不在
   // 构建输出里（线上实测 404）。现在无论带不带 ui 参数都进 Monaco 工作台。
   // 相对跳转：请求来自 <前缀>/wopi/edit，`../static/...` 由浏览器解析成
@@ -263,20 +269,20 @@ async function handleShim(req, res, u) {
 async function handleApi(req,res,u){
  const match=u.pathname.match(/^\/api\/(doc|unlock|keepalive|save|status|resolve)\/([A-Za-z0-9_-]+)$/);
  if(!match)return void send(res,404,{ok:false});
- const kind=match[1],sid=match[2],session=sessions.get(sid);
+ const kind=match[1],sid=match[2],session=recoverSession(sid);
  if(kind==='unlock'){if(req.method!=='POST')return void send(res,405,{ok:false});await collaboration.leave(sid);res.writeHead(204);return res.end();}
  if(!session||!live(session))return void send(res,404,{ok:false,error:'session expired'});
  session.lastSeen=Date.now();
  if(kind==='doc'&&req.method==='GET'){
   const {room,info,canWrite}=await collaboration.attach(session,sid);
-  return void send(res,200,{ok:true,name:info.name,canWrite,lockedByOther:room.blocked==='external-lock',content:room.text(),size:Buffer.byteLength(room.text()),draftKey:info.draftKey,version:info.version,eol:room.eol,capabilities:info.capabilities,collab:{roomId:room.key,user:collaboration.identity(session,info),status:collaboration.status(room)}});
+  return void send(res,200,{ok:true,name:info.name,canWrite,lockedByOther:room.blocked==='external-lock',content:room.text(),size:Buffer.byteLength(room.text()),draftKey:info.draftKey,version:info.version,eol:room.eol,capabilities:info.capabilities,collab:{roomId:room.key,epoch:room.epoch,user:collaboration.identity(session,info),status:collaboration.status(room)}});
  }
- const room=collaboration.roomFor(session);if(!room)return void send(res,409,{ok:false,error:'open document before collaboration requests'});
+ const room=collaboration.roomFor(session);if(!room)return void send(res,409,{ok:false,error:'open document before collaboration requests',recoverable:true});
  if(kind==='resolve'&&req.method==='POST'){
   let action='';try{action=JSON.parse((await readBody(req,4096)).toString('utf8')).action;}catch{}
   if(action!=='use-cloud')return void send(res,400,{ok:false,error:'unsupported action'});
   if(!room.blocked)return void send(res,409,{ok:false,error:'room is not blocked'});
-  await collaboration.discard(room);return void send(res,200,{ok:true});
+  await collaboration.discard(room);session.roomEpoch=null;session.rehydrated=false;persistedSessions.save(sid,session);return void send(res,200,{ok:true});
  }
  if(kind==='status'&&req.method==='GET')return void send(res,200,{ok:true,...collaboration.status(room)});
  if(kind==='keepalive'&&req.method==='POST'){room.lastSeen=Date.now();if(room.blocked)return void send(res,409,{ok:false,error:room.blocked});await collaboration.renew(room);return void send(res,200,{ok:true,expires:session.ttl,...collaboration.status(room)});}
@@ -345,7 +351,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-collaboration=createCollaboration({server,sessions,live,checkInfo:wopiCheckFileInfo,getContents:wopiGetContents,lock:wopiLock,refresh:wopiRefreshLock,put:wopiPutFile,unlock:wopiUnlock,dataDir:process.env.COLLAB_DATA_DIR||path.join(__dirname,'.runtime','rooms'),origin:req=>BASE_URL||'http://'+req.headers.host,sameOrigin,stripPrefix,saveDelay:Number(process.env.COLLAB_SAVE_MS)||1000,renewMs:RENEW_MS,graceMs:Number(process.env.COLLAB_GRACE_MS)||15000});
+collaboration=createCollaboration({server,sessions,live,checkInfo:wopiCheckFileInfo,getContents:wopiGetContents,lock:wopiLock,refresh:wopiRefreshLock,put:wopiPutFile,unlock:wopiUnlock,dataDir,recoverSession,onAttach:(s,sid)=>persistedSessions.save(sid,s),origin:req=>BASE_URL||'http://'+req.headers.host,sameOrigin,stripPrefix,saveDelay:Number(process.env.COLLAB_SAVE_MS)||1000,renewMs:RENEW_MS,graceMs:Number(process.env.COLLAB_GRACE_MS)||15000});
 let stopping=false;async function shutdown(){if(stopping)return;stopping=true;await collaboration.close();server.close(()=>process.exit(0));setTimeout(()=>process.exit(0),3000).unref();}
 process.on('SIGTERM',()=>void shutdown());process.on('SIGINT',()=>void shutdown());
 const BIND = process.env.BIND || '127.0.0.1';
