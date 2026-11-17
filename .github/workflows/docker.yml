@@ -114,6 +114,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # .dockerignore 排除了 .git，容器里 git rev-parse 必然失败；不传身份
+          # 前端「关于」就会显示 unknown(状态未知)。CI checkout 干净 ⇒ dirty=false。
+          build-args: |
+            BUILD_GIT_HASH=${{ github.sha }}
+            BUILD_GIT_DIRTY=false
           platforms: linux/${{ matrix.arch }}
           push: ${{ steps.mode.outputs.push }}
           tags: ${{ steps.mode.outputs.push == 'true' && format('{0}/{1}:tmp-{2}-{3}', env.REGISTRY, env.IMAGE, github.sha, matrix.arch) || '' }}
@@ -135,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           # --load 只把镜像导入 docker 存储，不需要执行它 ⇒ QEMU 场景也能查 config
-          docker buildx build --platform linux/${{ matrix.arch }} --load -t mw-check:${{ matrix.arch }} .
+          docker buildx build --platform linux/${{ matrix.arch }} --build-arg BUILD_GIT_HASH=${{ github.sha }} --build-arg BUILD_GIT_DIRTY=false --load -t mw-check:${{ matrix.arch }} .
           img="docker image inspect mw-check:${{ matrix.arch }}"
           arch="$($img --format '{{.Architecture}}')"
           echo "architecture: $arch"
