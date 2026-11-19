@@ -8,7 +8,7 @@ test('HTTP idle renewal, keepalive, conflict stop and readonly enforcement',{tim
  const host=http.createServer((req,res)=>{
   const u=new URL(req.url,'http://localhost');if(u.searchParams.get('access_token')!=='synthetic'){res.writeHead(401).end();return;}
   if(req.method==='GET'&&u.pathname.endsWith('/contents')){res.end('原文\r\ntext');return;}
-  if(req.method==='GET'){res.setHeader('Content-Type','application/json');res.end(JSON.stringify({BaseFileName:'test.md',UserId:'test-user',UserCanWrite:!u.pathname.includes('readonly'),SupportsLocks:true,Version:'1'}));return;}
+  if(req.method==='GET'){res.setHeader('Content-Type','application/json');const info={BaseFileName:'test.md',UserId:'test-user',SupportsLocks:true,Version:'1'};if(!u.pathname.includes('omit'))info.UserCanWrite=!u.pathname.includes('readonly');res.end(JSON.stringify(info));return;}
   const op=req.headers['x-wopi-override'];
   if(op==='LOCK'){locked=req.headers['x-wopi-lock'];res.end();return;}
   if(op==='REFRESH_LOCK'){refreshes++;res.writeHead(rejectRefresh?409:200).end();events.emit('renew');return;}
@@ -30,5 +30,7 @@ test('HTTP idle renewal, keepalive, conflict stop and readonly enforcement',{tim
   assert.equal((await request(base+'/api/unlock/'+sid,{method:'POST'})).status,204);
   rejectRefresh=false;const next=await session();const nextDoc=await request(base+'/api/doc/'+next).then(r=>r.json());assert.equal(nextDoc.draftKey,d.draftKey);await request(base+'/api/unlock/'+next,{method:'POST'});
   const ro=await session('/files/readonly');const readonly=await request(base+'/api/doc/'+ro).then(r=>r.json());assert.equal(readonly.canWrite,false);assert.equal((await request(base+'/api/doc/'+ro,{method:'PUT',body:'blocked'})).status,403);assert.equal(writes,0);
+  // A host that omits UserCanWrite entirely (anonymous share) must stay read-only end to end.
+  const om=await session('/files/omit');const omitted=await request(base+'/api/doc/'+om).then(r=>r.json());assert.equal(omitted.canWrite,false,'omitted UserCanWrite must not grant write access');assert.equal((await request(base+'/api/doc/'+om,{method:'PUT',body:'blocked'})).status,403);assert.equal((await request(base+'/api/save/'+om,{method:'POST',body:''})).status,403);assert.equal(writes,0);await request(base+'/api/unlock/'+om,{method:'POST'});
  }finally{child.kill();await once(child,'exit').catch(()=>{});await close(host);}
 });
