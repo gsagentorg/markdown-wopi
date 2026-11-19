@@ -72,12 +72,12 @@ PORT=3001 BASE_URL=http://127.0.0.1:3001 npm start
 
 ```bash
 # 直连 GHCR（海外网络）
-docker pull ghcr.io/gsmainagent/markdown-wopi:latest
-docker pull ghcr.io/gsmainagent/markdown-wopi:sha-<短 sha>   # 锁定具体构建
+docker pull ghcr.io/gsagentorg/markdown-wopi:latest
+docker pull ghcr.io/gsagentorg/markdown-wopi:sha-<短 sha>   # 锁定具体构建
 
 # 国内 / GHCR 直连不通时走 NJU 镜像站（只换前缀）
-docker pull ghcr.nju.edu.cn/gsmainagent/markdown-wopi:latest
-podman pull ghcr.nju.edu.cn/gsmainagent/markdown-wopi:latest
+docker pull ghcr.nju.edu.cn/gsagentorg/markdown-wopi:latest
+podman pull ghcr.nju.edu.cn/gsagentorg/markdown-wopi:latest
 ```
 
 tag 规则：`main`、`latest`（仅默认分支）、`sha-<短 sha>`；发 GitHub Release 时额外打 semver tag（当前尚未建 release）。PR 只构建不推送。
