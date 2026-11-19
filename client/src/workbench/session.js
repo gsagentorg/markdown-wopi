@@ -70,19 +70,23 @@ export function mountSession({editorHost,previewHost,store}){
   disposables.push(editor.onKeyDown(wrapSelection));
   disposables.push(model.onDidChangeContent(updateDocument),editor.onDidChangeCursorSelection(position));
   if(!demo){try{pruneDrafts(globalThis.localStorage);}catch{}}
-  if(!demo)recovery=createRecoveryController({key:data.draftKey,cloudText:data.content,onState(value){store.set({recovery:value});readOnly();},onRestore(text){editor.executeEdits('restore-draft',[{range:model.getFullModelRange(),text:text.replace(/\r\n/g,'\n'),forceMoveMarkers:true}]);editor.focus();},onNotice:notice,download,canRestore:()=>model.getValue()===initial});
+  // Draft storage is a write-side safety net. A viewer that was never granted write access
+  // (read-only share) must not create local drafts, and must not get a restore path that
+  // would surface edits; only an authorized writer owns draft state.
+  const ensureRecovery=()=>{if(demo||recovery||!authorized)return;recovery=createRecoveryController({key:data.draftKey,cloudText:data.content,onState(value){store.set({recovery:value});readOnly();},onRestore(text){editor.executeEdits('restore-draft',[{range:model.getFullModelRange(),text:text.replace(/\r\n/g,'\n'),forceMoveMarkers:true}]);editor.focus();},onNotice:notice,download,canRestore:()=>model.getValue()===initial});};
+  ensureRecovery();
   if(provider){
    provider.on('sync',synced=>{if(closed)return;if(synced){initialSynced=true;sessionRecovery?.reset();}store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
    provider.on('status',e=>{if(closed)return;store.set({connected:e.status==='connected'});if(e.status!=='connected'&&initialSynced)notice('连接断开，本地修改保留并等待合并');readOnly();void renderStatus(lastStatus);});
-   const terminal=event=>{if(event?.code===4403&&(!authorized||lastStatus.blocked)){recovery.flush();provider.disconnect();sessionRecovery?.stop();readOnly();notice('房间已变为只读或存在冲突，本地修改仍保留，请下载副本后处理');return;}authorized=false;lastStatus={...lastStatus,expired:true};recovery.flush();provider.disconnect();sessionRecovery?.stop();readOnly();store.set({banner:'会话已过期或权限被拒绝，已切换为只读；修改已保留在本机草稿。请下载副本或从 Cloudreve 重新打开。',bannerKind:'session'});};
-   sessionRecovery=recoverSession({flush:()=>recovery.flush(),reopen:()=>fetch(appUrl('api/doc/'+encodeURIComponent(sid)),{signal:fetchAbort.signal}),reconnect(next){
+   const terminal=event=>{if(event?.code===4403&&(!authorized||lastStatus.blocked)){recovery?.flush();provider.disconnect();sessionRecovery?.stop();readOnly();notice('房间已变为只读或存在冲突，本地修改仍保留，请下载副本后处理');return;}authorized=false;lastStatus={...lastStatus,expired:true};recovery?.flush();provider.disconnect();sessionRecovery?.stop();readOnly();store.set({banner:'会话已过期或权限被拒绝，已切换为只读；修改已保留在本机草稿。请下载副本或从 Cloudreve 重新打开。',bannerKind:'session'});};
+   sessionRecovery=recoverSession({flush:()=>recovery?.flush(),reopen:()=>fetch(appUrl('api/doc/'+encodeURIComponent(sid)),{signal:fetchAbort.signal}),reconnect(next){
     if(closed)return;
     if(next.collab?.roomId!==data.collab.roomId||next.collab?.epoch!==data.collab.epoch){notice('恢复房间不匹配，已保留本机草稿');return;}
-    authorized=!!next.canWrite;lastStatus=next.collab.status;data={...data,...next};
+    authorized=!!next.canWrite;lastStatus=next.collab.status;data={...data,...next};ensureRecovery();
     // Never seed or replace the model: protocol state vectors merge into this Y.Doc.
     provider.connect();readOnly();void renderStatus(lastStatus);
    },onTerminal:terminal,onTransient(){notice('连接暂时不可用，草稿已保留；正在尝试恢复会话');},onExhausted(){notice('自动恢复次数已用尽，本地正文仍保留；请下载副本或从 Cloudreve 重新打开');}});
-   const recover=()=>{if(closed||lastStatus.expired)return;recovery.flush();provider.disconnect();void sessionRecovery.recover();};
+   const recover=()=>{if(closed||lastStatus.expired)return;recovery?.flush();provider.disconnect();void sessionRecovery.recover();};
    cleanups.push(watchSessionRecovery({provider,recover,terminal,isClosed:()=>closed}));
    provider.awareness.on('change',refreshPeers);provider.awareness.setLocalStateField('user',data.collab.user);lastStatus=data.collab.status;provider.connect();
    presence=keepSession({ping:()=>fetch(appUrl('api/keepalive/'+sid),{method:'POST'}),onLost(status){if([401,403,404].includes(status))terminal();else recover();},onNotice:notice,interval:240000});
