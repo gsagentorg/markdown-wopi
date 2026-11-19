@@ -4,15 +4,18 @@ import state from '../server-state.cjs';
 const {fileMetadata,shouldRenew,refreshError}=state;
 test('recovery key stable across token rotation but scoped to user, host and file',()=>{const a={wopisrc:'https://host.test/wopi/1?access_token=old'},b={wopisrc:'https://host.test/wopi/1?access_token=new'};const info={UserId:'A',BaseFileName:'文.md',UserCanWrite:true};const x=fileMetadata(a,info),y=fileMetadata(b,info);assert.match(x.draftKey,/^[a-f0-9]{64}$/);assert.equal(x.draftKey,y.draftKey);assert.notEqual(x.draftKey,fileMetadata(a,{...info,UserId:'B'}).draftKey);assert.notEqual(x.draftKey,fileMetadata({wopisrc:'https://host.test/wopi/2'},info).draftKey);assert.equal(fileMetadata(a,{BaseFileName:'x'}).draftKey,null);assert.ok(!JSON.stringify(x).includes('token'));});
 test('host capabilities are explicit, readonly trumps write flag',()=>{const s={wopisrc:'https://x.test/files/1'};assert.equal(fileMetadata(s,{UserId:'A',ReadOnly:true,UserCanWrite:true}).canWrite,false);assert.equal(fileMetadata(s,{UserCanNotWriteRelative:false}).capabilities.relativeWrite,true);assert.equal(fileMetadata(s,{}).capabilities.directoryList,false);});
-test('write permission is fail-closed: only an explicit host yes grants editing',()=>{
+test('path 1: an explicit host yes keeps the owner/admin writable (unchanged behaviour)',()=>{
+ const s={wopisrc:'https://x.test/files/1'};
+ assert.equal(fileMetadata(s,{UserId:'admin',UserCanWrite:true}).canWrite,true,'explicit UserCanWrite:true must stay writable');
+ assert.equal(fileMetadata(s,{UserId:'admin',UserCanWrite:true,ReadOnly:false}).canWrite,true);
+});
+test('path 2: a missing or non-boolean host verdict is read-only (anonymous share stays fail-closed)',()=>{
  const s={wopisrc:'https://x.test/files/1'};
  assert.equal(fileMetadata(s,{}).canWrite,false,'omitted UserCanWrite must not grant write access');
  assert.equal(fileMetadata(s,{UserId:'A',BaseFileName:'x.md'}).canWrite,false,'unrelated fields must not grant write access');
  assert.equal(fileMetadata(s,{UserCanWrite:false}).canWrite,false);
  assert.equal(fileMetadata(s,{ReadOnly:true,UserCanWrite:true}).canWrite,false);
  assert.equal(fileMetadata(s,{UserCanWrite:'true'}).canWrite,false,'a non-boolean approval is not permission');
- assert.equal(fileMetadata(s,{UserCanWrite:true}).canWrite,true);
- assert.equal(fileMetadata(s,{UserCanWrite:true,ReadOnly:false}).canWrite,true);
 });
 test('lease renewal obeys presence, lock, expiry and next-deadline',()=>{const s={lockId:'l',created:1000,lastSeen:2000,ttl:90000,nextRefresh:3000};assert.equal(shouldRenew(s,4000,12000),true);for(const patch of [{lockId:null},{lockFailed:true},{closing:true},{ttl:3000},{lastSeen:-20000},{nextRefresh:5000}])assert.equal(shouldRenew({...s,...patch},4000,12000),false);});
 test('refresh failures map to fail-closed conflict or permission errors',()=>{assert.equal(refreshError(409).status,409);assert.equal(refreshError(401).status,403);assert.equal(refreshError(500).status,502);});
