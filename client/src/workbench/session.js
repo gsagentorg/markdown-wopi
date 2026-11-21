@@ -80,7 +80,9 @@ export function mountSession({editorHost,previewHost,store}){
   const ensureRecovery=()=>{if(demo||recovery||!authorized)return;recovery=createRecoveryController({key:data.draftKey,cloudText:data.content,onState(value){store.set({recovery:value});readOnly();},onRestore(text){editor.executeEdits('restore-draft',[{range:model.getFullModelRange(),text:text.replace(/\r\n/g,'\n'),forceMoveMarkers:true}]);editor.focus();},onNotice:notice,download,canRestore:()=>model.getValue()===initial});};
   ensureRecovery();
   if(provider){
-   provider.on('sync',synced=>{if(closed)return;if(synced){initialSynced=true;sessionRecovery?.reset();}store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
+   // An empty Y.Text's relative selection resolves to EOF after its first remote insert.
+   // Sync step 2 has already applied that insert; normalize only the initial view, not reconnects.
+   provider.on('sync',synced=>{if(closed)return;if(synced){if(!initialSynced){editor.setPosition({lineNumber:1,column:1});editor.setScrollTop(0);}initialSynced=true;sessionRecovery?.reset();}store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
    provider.on('status',e=>{if(closed)return;store.set({connected:e.status==='connected'});if(e.status!=='connected'&&initialSynced)notice('连接断开，本地修改保留并等待合并');readOnly();void renderStatus(lastStatus);});
    const terminal=event=>{if(event?.code===4403&&(!authorized||lastStatus.blocked)){recovery?.flush();provider.disconnect();sessionRecovery?.stop();readOnly();notice('房间已变为只读或存在冲突，本地修改仍保留，请下载副本后处理');return;}authorized=false;lastStatus={...lastStatus,expired:true};recovery?.flush();provider.disconnect();sessionRecovery?.stop();readOnly();store.set({banner:'会话已过期或权限被拒绝，已切换为只读；修改已保留在本机草稿。请下载副本或从 Cloudreve 重新打开。',bannerKind:'session'});};
    sessionRecovery=recoverSession({flush:()=>recovery?.flush(),reopen:()=>fetch(appUrl('api/doc/'+encodeURIComponent(sid)),{signal:fetchAbort.signal}),reconnect(next){
