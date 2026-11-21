@@ -14,7 +14,7 @@ import {connectMonacoPreview} from '../monaco-preview-sync.js';
 import {imageMarkdown} from '../embedded-images-core.js';
 import {keepSession,recoverSession,watchSessionRecovery} from '../presence.js';
 import {createRecoveryController} from './recovery-controller.js';
-import {activeHeading,mayReload} from './state.js';
+import {activeHeading,mayReload,outlineAnchorLine} from './state.js';
 import {demoDocument} from './demo.js';
 import '../code-colors.css';
 import 'katex/dist/katex.min.css';
@@ -23,7 +23,7 @@ globalThis.MonacoEnvironment={getWorker:()=>new Worker(appUrl('static/monaco/edi
 // React owns views. This controller owns exactly one Monaco/Y.Doc/provider lifecycle.
 export function mountSession({editorHost,previewHost,store}){
  const params=new URLSearchParams(location.hash.slice(1)),query=new URLSearchParams(location.search),sid=params.get('s'),demo=query.get('demo')==='1';
- let editor,model,provider,ydoc,binding,undo,recovery,pipeline,previewSync,features,presence,sessionRecovery,data,lastStatus={},closed=false,initialSynced=false,authorized=false,renderToken=0,timer,themeCleanup,allowUnload=false;
+ let editor,model,provider,ydoc,binding,undo,recovery,pipeline,previewSync,features,presence,sessionRecovery,data,lastStatus={},closed=false,initialSynced=false,authorized=false,renderToken=0,timer,themeCleanup,allowUnload=false,headingFrame;
  const disposables=[],cleanups=[],fetchAbort=new AbortController();
  const snapshot=()=>store.getSnapshot(),notice=text=>!closed&&store.set({notice:text}),serialize=()=>model?.getValue().replace(/\n/g,data?.eol||'\n')||'';
  function readOnly(){const ro=!canEdit({authorized,blocked:!!lastStatus.blocked,initialSynced,pendingRecovery:recovery?.pending||snapshot().recovery?.pending});editor?.updateOptions({readOnly:ro});store.set({readOnly:ro,authorized});}
@@ -33,6 +33,10 @@ export function mountSession({editorHost,previewHost,store}){
  function analyze(){if(!model||closed)return;const headings=features.analyze(model).headings;store.set({headings,activeHeading:activeHeading(headings,editor.getPosition()?.lineNumber||1)});pipeline.update(model.getValue());}
  function updateDocument(){if(closed)return;renderToken++;recovery?.changed(serialize());store.set({localDirty:!demo});clearTimeout(timer);timer=setTimeout(analyze,100);}
  function position(){if(!editor||closed)return;const p=editor.getPosition(),selection=editor.getSelection();if(!p)return;store.set({cursor:{line:p.lineNumber,column:p.column,selected:selection?model.getValueLengthInRange(selection):0},activeHeading:activeHeading(snapshot().headings,p.lineNumber)});previewSync?.selection();}
+ // Scrolling (wheel, preview-linked, programmatic reveal) never fires cursor events; without
+ // this the outline highlight freezes on the last cursor section. rAF-throttled per frame.
+ function syncHeadingFromViewport(){if(!editor||closed)return;const ranges=editor.getVisibleRanges();if(!ranges.length)return;store.set({activeHeading:activeHeading(snapshot().headings,outlineAnchorLine(ranges,editor.getPosition()?.lineNumber))});}
+ function scheduleHeadingSync(){cancelAnimationFrame(headingFrame);headingFrame=requestAnimationFrame(()=>{headingFrame=null;syncHeadingFromViewport();});}
  function refreshPeers(){if(!provider||closed)return;const peers=[];for(const [id,state]of provider.awareness.getStates()){if(state.user)peers.push({id,user:state.user});}store.set({peers});}
  function download(text=serialize(),prefix=''){if(!model)return;const url=URL.createObjectURL(new Blob([text],{type:'text/markdown;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download=prefix+(data.name||'document.md');a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
  function save(){if(demo)return notice('这是本机界面预览，不写入任何文件');if(lastStatus.expired)return notice('会话已过期：修改已保存在本机草稿，请下载副本或从 Cloudreve 重新打开后恢复');if(!provider?.wsconnected||!provider.synced||!authorized||lastStatus.blocked||recovery?.pending)return notice('尚未连接到可写房间，请保留或下载本机副本');provider.ws.send(new Uint8Array([5]));}
@@ -68,7 +72,7 @@ export function mountSession({editorHost,previewHost,store}){
    }));
   };
   disposables.push(editor.onKeyDown(wrapSelection));
-  disposables.push(model.onDidChangeContent(updateDocument),editor.onDidChangeCursorSelection(position));
+  disposables.push(model.onDidChangeContent(updateDocument),editor.onDidChangeCursorSelection(position),editor.onDidScrollChange(e=>{if(e.scrollTopChanged)scheduleHeadingSync();}));
   if(!demo){try{pruneDrafts(globalThis.localStorage);}catch{}}
   // Draft storage is a write-side safety net. A viewer that was never granted write access
   // (read-only share) must not create local drafts, and must not get a restore path that
@@ -76,7 +80,9 @@ export function mountSession({editorHost,previewHost,store}){
   const ensureRecovery=()=>{if(demo||recovery||!authorized)return;recovery=createRecoveryController({key:data.draftKey,cloudText:data.content,onState(value){store.set({recovery:value});readOnly();},onRestore(text){editor.executeEdits('restore-draft',[{range:model.getFullModelRange(),text:text.replace(/\r\n/g,'\n'),forceMoveMarkers:true}]);editor.focus();},onNotice:notice,download,canRestore:()=>model.getValue()===initial});};
   ensureRecovery();
   if(provider){
-   provider.on('sync',synced=>{if(closed)return;if(synced){initialSynced=true;sessionRecovery?.reset();}store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
+   // An empty Y.Text's relative selection resolves to EOF after its first remote insert.
+   // Sync step 2 has already applied that insert; normalize only the initial view, not reconnects.
+   provider.on('sync',synced=>{if(closed)return;if(synced){if(!initialSynced){editor.setPosition({lineNumber:1,column:1});editor.setScrollTop(0);}initialSynced=true;sessionRecovery?.reset();}store.set({initialSynced});readOnly();if(synced){analyze();position();void renderStatus(lastStatus);}});
    provider.on('status',e=>{if(closed)return;store.set({connected:e.status==='connected'});if(e.status!=='connected'&&initialSynced)notice('连接断开，本地修改保留并等待合并');readOnly();void renderStatus(lastStatus);});
    const terminal=event=>{if(event?.code===4403&&(!authorized||lastStatus.blocked)){recovery?.flush();provider.disconnect();sessionRecovery?.stop();readOnly();notice('房间已变为只读或存在冲突，本地修改仍保留，请下载副本后处理');return;}authorized=false;lastStatus={...lastStatus,expired:true};recovery?.flush();provider.disconnect();sessionRecovery?.stop();readOnly();store.set({banner:'会话已过期或权限被拒绝，已切换为只读；修改已保留在本机草稿。请下载副本或从 Cloudreve 重新打开。',bannerKind:'session'});};
    sessionRecovery=recoverSession({flush:()=>recovery?.flush(),reopen:()=>fetch(appUrl('api/doc/'+encodeURIComponent(sid)),{signal:fetchAbort.signal}),reconnect(next){
@@ -103,6 +109,6 @@ export function mountSession({editorHost,previewHost,store}){
  const pageHide=e=>{if(e.persisted){recovery?.flush();provider?.disconnect();}else destroy();};
  const pageShow=e=>{if(e.persisted&&!closed){recovery?.flush();void sessionRecovery?.recover();}};
  window.addEventListener('beforeunload',beforeUnload);window.addEventListener('pagehide',pageHide);window.addEventListener('pageshow',pageShow);
- function destroy(){if(closed)return;closed=true;renderToken++;fetchAbort.abort();clearTimeout(timer);presence?.stop();sessionRecovery?.stop();recovery?.destroy();provider?.destroy();binding?.destroy();undo?.destroy();disposables.forEach(d=>d.dispose());cleanups.forEach(fn=>fn());pipeline?.destroy();previewSync?.destroy();features?.destroy();themeCleanup?.();editor?.dispose();model?.dispose();ydoc?.destroy();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('pagehide',pageHide);window.removeEventListener('pageshow',pageShow);if(!demo&&sid)try{navigator.sendBeacon(appUrl('api/unlock/'+sid));}catch{}if(globalThis.__wopiQA===controller)delete globalThis.__wopiQA;}
+ function destroy(){if(closed)return;closed=true;renderToken++;fetchAbort.abort();clearTimeout(timer);cancelAnimationFrame(headingFrame);presence?.stop();sessionRecovery?.stop();recovery?.destroy();provider?.destroy();binding?.destroy();undo?.destroy();disposables.forEach(d=>d.dispose());cleanups.forEach(fn=>fn());pipeline?.destroy();previewSync?.destroy();features?.destroy();themeCleanup?.();editor?.dispose();model?.dispose();ydoc?.destroy();window.removeEventListener('beforeunload',beforeUnload);window.removeEventListener('pagehide',pageHide);window.removeEventListener('pageshow',pageShow);if(!demo&&sid)try{navigator.sendBeacon(appUrl('api/unlock/'+sid));}catch{}if(globalThis.__wopiQA===controller)delete globalThis.__wopiQA;}
  controller.ready=start().catch(e=>{if(!closed)store.set({phase:'error',banner:e.message});});return controller;
 }

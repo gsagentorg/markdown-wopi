@@ -23,5 +23,8 @@ export function outlineOpenForWidth(width){return width>=OUTLINE_DRAWER_AT;}
 export function layoutForWidth(width){return width>=SPLIT_MIN_WIDTH?'split':'editor';}
 
 export function activeHeading(headings,line){return headings.filter(h=>h.line<=line).at(-1)?.id||null;}
+// Wheel/preview scrolling fires no cursor events: anchor the outline on the viewport's top edge,
+// but keep the cursor's section while the cursor itself is still on screen (typing, programmatic jumps).
+export function outlineAnchorLine(ranges,cursorLine){if(cursorLine!=null&&ranges.some(r=>cursorLine>=r.startLineNumber&&cursorLine<=r.endLineNumber))return cursorLine;return ranges[0]?.startLineNumber??null;}
 export function mayReload(s){return !s.localDirty&&!s.status?.dirty&&!s.recovery?.pending;}
 export const initialState={phase:'loading',name:'正在打开文稿…',authorized:false,readOnly:true,connected:false,initialSynced:false,localDirty:false,demo:false,headings:[],activeHeading:null,status:{},notice:'',banner:'',bannerKind:'',recovery:null,cursor:{line:1,column:1,selected:0},eol:'LF',peers:[],wrapped:true,syncScroll:true,duration:null};
