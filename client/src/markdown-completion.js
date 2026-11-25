@@ -199,7 +199,59 @@ export function markdownCompletions(model, { lineNumber: row, column }) {
   return candidate ? mathCompletions(model, row, line, cursor, block, blocks, candidate) : null;
 }
 
-export const markdownCompletionTriggers = ['\\', '{', '`', '~'];
+// Reference labels come from `[label]: url` definitions the preview renders as links.
+function linkDefinitions(model, blocks) {
+  const definitions = [];
+  const count = model.getLineCount();
+  for (let n = 1; n <= count; n++) {
+    const block = blocks.get(n);
+    if (block && ['fence', 'code_block', 'html_block'].includes(block.type)) continue;
+    const match = /^ {0,3}\[([^\[\]]+)\]:[ \t]*(\S+)/.exec(model.getLineContent(n));
+    if (!match) continue;
+    const label = match[1].trim().replace(/\s+/g, ' ');
+    // `[^x]: …` is not a link label: the preview has no footnote support.
+    if (!label || label.startsWith('^')) continue;
+    definitions.push({ label, url: match[2] });
+  }
+  return definitions;
+}
+
+// Resolve inline-code spans to the current row so `[text][` inside code stays quiet.
+function inlineCodeOnLine(model, block, row) {
+  if (block?.type !== 'inline') return [];
+  const lines = [];
+  for (let n = block.map[0] + 1; n <= block.map[1]; n++) lines.push(model.getLineContent(n));
+  const offset = lines.slice(0, row - block.map[0] - 1).reduce((sum, line) => sum + line.length + 1, 0);
+  const width = model.getLineContent(row).length;
+  return inlineCodeRanges(lines.join('\n'))
+    .map(([start, end]) => [start - offset, end - offset])
+    .filter(([start, end]) => end > 0 && start < width)
+    .map(([start, end]) => [Math.max(0, start), Math.min(width, end)]);
+}
+
+// `[text][label` completes labels defined anywhere in the document; the closing `]` is left alone.
+export function referenceCompletions(model, { lineNumber: row, column }) {
+  const line = model.getLineContent(row);
+  const cursor = column - 1;
+  const fragment = /\[([^\[\]]*)\]\[([^\[\]]*)$/.exec(line.slice(0, cursor));
+  if (!fragment) return null;
+  const { blocks } = documentBlocks(model);
+  const block = blocks.get(row);
+  if (block && ['fence', 'code_block', 'html_block', 'math_block'].includes(block.type)) return [];
+  const start = cursor - fragment[2].length;
+  const code = inlineCodeOnLine(model, block, row);
+  if (code.some(([from, to]) => start >= from && start < to)) return [];
+  if (block?.type === 'inline' && inlineBounds(line, cursor, code)) return [];
+  const prefix = fragment[2].trim().replace(/\s+/g, ' ').toLowerCase();
+  const shorten = value => (value.length > 80 ? value.slice(0, 79) + '…' : value);
+  return linkDefinitions(model, blocks)
+    .filter(({ label }) => label.toLowerCase().startsWith(prefix))
+    .map(({ label, url }) => ({
+      label, detail: shorten(url), insertText: label, start, end: cursor, kind: 'Reference',
+    }));
+}
+
+export const markdownCompletionTriggers = ['\\', '{', '`', '~', '['];
 
 export function toMonacoCompletionItems(monaco, row, items) {
   return {
