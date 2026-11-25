@@ -63,10 +63,10 @@ test('detail shows level, section path and duplicate ordinals', async () => {
   const { at } = await setup();
   const items = at(doc);
   const byId = Object.fromEntries(items.map(item => [item.insertText, item]));
-  assert.equal(byId['设计原则'].detail, 'h1#设计原则');
-  assert.equal(byId['当前迭代'].detail, 'h1#设计原则 > h2#当前迭代');
-  assert.equal(byId['当前迭代-1'].detail, 'h1#设计原则 > h2#当前迭代-1（同名第 2 个）');
-  assert.equal(byId['一小段代码'].detail, 'h1#设计原则 > h2#当前迭代 > h3#一小段代码');
+  assert.equal(byId['设计原则'].detail, '设计原则');
+  assert.equal(byId['当前迭代'].detail, '设计原则 > 当前迭代');
+  assert.equal(byId['当前迭代-1'].detail, '设计原则 > 当前迭代（第 2 个同名）');
+  assert.equal(byId['一小段代码'].detail, '设计原则 > 当前迭代 > 一小段代码');
 });
 
 test('filter text carries the heading text so CJK typing matches the slug', async () => {
@@ -85,7 +85,7 @@ test('inserted ids are the ids the preview emits, including punctuation and repe
   const ids = [...html.matchAll(/<h1 [^>]*id="([^"]+)"/g)].map(match => match[1]);
   assert.deepEqual(items.map(item => item.insertText), ids);
   const detail = items[0].detail;
-  assert.equal(detail, 'h1#结论为什么（结论：为什么？）');
+  assert.equal(detail, '结论：为什么？');
 });
 
 test('stays quiet inside fenced and indented code and in plain prose', async () => {
