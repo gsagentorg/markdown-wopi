@@ -1,6 +1,7 @@
 import MarkdownIt from 'markdown-it';
 import {katex} from '@mdit/plugin-katex';
 import {previewLanguages} from './code-languages.js';
+import {analyzeMarkdown} from './markdown-analysis.js';
 
 const parser = new MarkdownIt({ html: false }).use(katex, {delimiters: 'all', mathFence: true});
 const cache = new WeakMap();
@@ -249,6 +250,33 @@ export function referenceCompletions(model, { lineNumber: row, column }) {
     .map(({ label, url }) => ({
       label, detail: shorten(url), insertText: label, start, end: cursor, kind: 'Reference',
     }));
+}
+
+// `[text](#head` completes the slugs the preview generates for this document.
+export function anchorCompletions(model, { lineNumber: row, column }) {
+  const line = model.getLineContent(row);
+  const cursor = column - 1;
+  const fragment = /\]\(#([^\s)]*)$/.exec(line.slice(0, cursor));
+  if (!fragment) return null;
+  const { blocks } = documentBlocks(model);
+  const block = blocks.get(row);
+  if (block && ['fence', 'code_block', 'html_block', 'math_block'].includes(block.type)) return [];
+  const start = cursor - fragment[1].length;
+  const stack = [];
+  const seen = new Map();
+  return analyzeMarkdown(model.getValue()).headings.map(heading => {
+    while (stack.length && stack.at(-1).level >= heading.level) stack.pop();
+    const trail = [...stack.map(item => item.text), heading.text].filter(Boolean).join(' › ');
+    stack.push(heading);
+    const ordinal = (seen.get(heading.text) ?? 0) + 1;
+    seen.set(heading.text, ordinal);
+    // Nested headings are indented by level so duplicates stay visually distinct.
+    const detail = `H${heading.level} · ${trail}` + (ordinal > 1 ? ` · 同名 #${ordinal}` : '');
+    return {
+      label: '#' + heading.id, filterText: heading.id + ' ' + heading.text, detail,
+      insertText: heading.id, start, end: cursor, kind: 'Reference',
+    };
+  });
 }
 
 export const markdownCompletionTriggers = ['\\', '{', '`', '~', '['];
