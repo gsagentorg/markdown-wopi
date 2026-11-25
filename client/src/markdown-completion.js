@@ -266,12 +266,16 @@ export function anchorCompletions(model, { lineNumber: row, column }) {
   const seen = new Map();
   return analyzeMarkdown(model.getValue()).headings.map(heading => {
     while (stack.length && stack.at(-1).level >= heading.level) stack.pop();
-    const trail = [...stack.map(item => item.text), heading.text].filter(Boolean).join(' › ');
+    const segment = item => `h${item.level}#${item.id}`;
+    const parents = stack.filter(item => item.text || item.id).map(segment);
     stack.push(heading);
     const ordinal = (seen.get(heading.text) ?? 0) + 1;
     seen.set(heading.text, ordinal);
-    // Nested headings are indented by level so duplicates stay visually distinct.
-    const detail = `H${heading.level} · ${trail}` + (ordinal > 1 ? ` · 同名 #${ordinal}` : '');
+    // Selector-style path: the anchor plus where it sits, e.g. h1#甲 > h2#乙-1（同名第 2 个）.
+    const notes = [];
+    if (ordinal > 1) notes.push(`同名第 ${ordinal} 个`);
+    else if (heading.text && heading.text !== heading.id) notes.push(heading.text);
+    const detail = [...parents, segment(heading) + (notes.length ? `（${notes.join('，')}）` : '')].join(' > ');
     return {
       label: '#' + heading.id, filterText: heading.id + ' ' + heading.text, detail,
       insertText: heading.id, start, end: cursor, kind: 'Reference',
