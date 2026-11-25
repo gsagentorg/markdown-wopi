@@ -1,6 +1,6 @@
 import MarkdownIt from 'markdown-it';
 import {katex} from '@mdit/plugin-katex';
-import {previewLanguages} from './code-languages.js';
+import {previewKeywords,previewLanguages} from './code-languages.js';
 import {analyzeMarkdown} from './markdown-analysis.js';
 
 const parser = new MarkdownIt({ html: false }).use(katex, {delimiters: 'all', mathFence: true});
@@ -183,12 +183,11 @@ function mathCompletions(model, row, line, cursor, block, blocks, candidate) {
 export function markdownCompletions(model, { lineNumber: row, column }) {
   const line = model.getLineContent(row);
   const cursor = column - 1;
-  const candidate = /\\(?:begin\{([a-zA-Z]*)|([a-zA-Z]*))$/.exec(line.slice(0, cursor));
-  if (!candidate && !/[`~]{3}/.test(line)) return null;
   const { blocks } = documentBlocks(model);
   const block = blocks.get(row);
+  // Fenced bodies need a language before any other Markdown rule is considered.
   if (block?.type === 'fence') {
-    if (row !== block.map[0] + 1) return [];
+    if (row !== block.map[0] + 1) return codeBodyCompletions(model, row, column, block);
     const language = fenceLanguage(block, line, cursor);
     if (!language) return [];
     const { start, end, prefix } = language;
@@ -197,6 +196,9 @@ export function markdownCompletions(model, { lineNumber: row, column }) {
       return match ? [{ label: id, filterText: match, detail: 'Preview language', insertText: id, start, end, kind: 'Value' }] : [];
     });
   }
+  if (block?.type === 'code_block' || block?.type === 'html_block') return [];
+  const candidate = /\\(?:begin\{([a-zA-Z]*)|([a-zA-Z]*))$/.exec(line.slice(0, cursor));
+  if (!candidate && !/[`~]{3}/.test(line)) return null;
   return candidate ? mathCompletions(model, row, line, cursor, block, blocks, candidate) : null;
 }
 
@@ -250,6 +252,20 @@ export function referenceCompletions(model, { lineNumber: row, column }) {
     .map(({ label, url }) => ({
       label, detail: shorten(url), insertText: label, start, end: cursor, kind: 'Reference',
     }));
+}
+
+// Inside a fenced block, suggest the keywords of the language the preview highlights with.
+function codeBodyCompletions(model, row, column, block) {
+  const line = model.getLineContent(row);
+  const cursor = column - 1;
+  // The closing marker is structure, not code.
+  if (row === block.map[1] && /^\s*(?:`{3,}|~{3,})\s*$/.test(line)) return [];
+  const words = previewKeywords(block.info);
+  if (!words.length) return [];
+  const prefix = /[A-Za-z_$][\w$]*$/.exec(line.slice(0, cursor));
+  if (!prefix) return [];
+  const start = cursor - prefix[0].length;
+  return words.map(name => ({ label: name, detail: 'keyword', insertText: name, start, end: cursor, kind: 'Keyword' }));
 }
 
 // `[text](#head` completes the slugs the preview generates for this document.
