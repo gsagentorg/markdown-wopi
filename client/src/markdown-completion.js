@@ -1,6 +1,6 @@
 import MarkdownIt from 'markdown-it';
 import {katex} from '@mdit/plugin-katex';
-import {previewKeywords,previewLanguages} from './code-languages.js';
+import {previewGrammar,previewKeywords,previewLanguages} from './code-languages.js';
 import {analyzeMarkdown} from './markdown-analysis.js';
 
 const parser = new MarkdownIt({ html: false }).use(katex, {delimiters: 'all', mathFence: true});
@@ -255,17 +255,34 @@ export function referenceCompletions(model, { lineNumber: row, column }) {
 }
 
 // Inside a fenced block, suggest the keywords of the language the preview highlights with.
+function documentIdentifiers(model, blocks, current, grammar) {
+  const seen = new Set();
+  for (const [line, token] of blocks) {
+    if (token.type !== 'fence' || token === current) continue;
+    if (previewGrammar(token.info) !== grammar) continue;
+    for (const word of model.getLineContent(line).matchAll(/[A-Za-z_$][\w$]{2,39}/g)) seen.add(word[0]);
+  }
+  return [...seen];
+}
+
 function codeBodyCompletions(model, row, column, block) {
   const line = model.getLineContent(row);
   const cursor = column - 1;
   // The closing marker is structure, not code.
   if (row === block.map[1] && /^\s*(?:`{3,}|~{3,})\s*$/.test(line)) return [];
-  const words = previewKeywords(block.info);
-  if (!words.length) return [];
+  const keywords = previewKeywords(block.info);
+  if (!keywords.length) return [];
   const prefix = /[A-Za-z_$][\w$]*$/.exec(line.slice(0, cursor));
   if (!prefix) return [];
   const start = cursor - prefix[0].length;
-  return words.map(name => ({ label: name, detail: 'keyword', insertText: name, start, end: cursor, kind: 'Keyword' }));
+  const known = new Set(keywords);
+  const { blocks } = documentBlocks(model);
+  const local = documentIdentifiers(model, blocks, block, previewGrammar(block.info)).filter(word => !known.has(word));
+  const item = (name, detail, sort) => ({ label: name, detail, insertText: name, start, end: cursor, kind: 'Value', sortText: sort + name });
+  return [
+    ...keywords.map(name => ({ ...item(name, 'keyword', '0'), kind: 'Keyword' })),
+    ...local.map(name => item(name, 'used in this document', '1')),
+  ];
 }
 
 // `[text](#head` completes the slugs the preview generates for this document.

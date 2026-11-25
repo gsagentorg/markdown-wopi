@@ -89,3 +89,14 @@ test('does not suggest keywords on the opening fence line', async () => {
   const { at } = await setup();
   assert.deepEqual(keywordsOf(at(fence + 'js¦\nconst x = 1\n' + fence + '\n')), []);
 });
+
+test('offers identifiers used in other blocks of the same grammar, not other languages', async () => {
+  const { at } = await setup();
+  const source = fence + 'js\nconst myTotal = 1;\n' + fence + '\n\n' + fence + 'py\nbarVar = 2\n' + fence + '\n\n' + fence + 'js\nmy¦\n' + fence + '\n';
+  const items = at(source);
+  const mine = items.find(item => item.label === 'myTotal');
+  assert.ok(mine, 'identifier from the sibling js block');
+  assert.equal(mine.detail, 'used in this document');
+  assert.ok(items.some(item => item.detail === 'keyword'));
+  assert.ok(!items.some(item => item.label === 'barVar'));
+});
